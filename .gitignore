@@ -5,6 +5,9 @@ __pycache__/
 config.json
 sessions/
 backup/
+skills/
+memory/
+logs/
 .venv/
 .idea/
 .vscode/

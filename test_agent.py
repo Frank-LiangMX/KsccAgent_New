@@ -40,4 +40,5 @@ async def test_agent():
         import traceback
         traceback.print_exc()
 
-asyncio.run(test_agent())
+if __name__ == "__main__":
+    asyncio.run(test_agent())

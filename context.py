@@ -1,5 +1,5 @@
 """
-Quark Agent - Token 统计 & Context Window 管理
+Kscc Agent - Token 统计 & Context Window 管理
 
 全部本地计算，不依赖外部服务。
 """

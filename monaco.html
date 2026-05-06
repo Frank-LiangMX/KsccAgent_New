@@ -23,7 +23,7 @@
     <div id="editor"></div>
   </div>
   <div id="menu">
-    <div class="item" data-action="ask-selection">Ask Quark about selection (Ctrl+L)</div>
+    <div class="item" data-action="ask-selection">Ask Kscc about selection (Ctrl+L)</div>
     <div class="item" data-action="ask-file">Ask about this file</div>
     <div class="sep"></div>
     <div class="item" data-action="copy">Copy selection</div>
@@ -199,19 +199,19 @@
 
   function createEditor(monaco){
     const getColors = (mode) => {
-      if (typeof window.getQuarkMonacoThemeColors === 'function') {
-        return window.getQuarkMonacoThemeColors(mode);
+      if (typeof window.getKsccMonacoThemeColors === 'function') {
+        return window.getKsccMonacoThemeColors(mode);
       }
       return window.QUARK_MONACO_THEME_DARK || window.QUARK_MONACO_THEME_COLORS || {};
     };
 
-    monaco.editor.defineTheme('quark-dark', {
+    monaco.editor.defineTheme('kscc-dark', {
       base: 'vs-dark',
       inherit: true,
       rules: [],
       colors: getColors('dark')
     });
-    monaco.editor.defineTheme('quark-light', {
+    monaco.editor.defineTheme('kscc-light', {
       base: 'vs',
       inherit: true,
       rules: [],
@@ -220,7 +220,7 @@
 
     window.setThemeMode = function(mode){
       currentThemeMode = (String(mode || 'dark').toLowerCase() === 'light') ? 'light' : 'dark';
-      const themeName = currentThemeMode === 'light' ? 'quark-light' : 'quark-dark';
+      const themeName = currentThemeMode === 'light' ? 'kscc-light' : 'kscc-dark';
       document.documentElement.setAttribute('data-theme', currentThemeMode);
       try { monaco.editor.setTheme(themeName); } catch(_e) {}
     };
@@ -229,7 +229,7 @@
       value: '',
       language: 'plaintext',
       automaticLayout: true,
-      theme: (currentThemeMode === 'light' ? 'quark-light' : 'quark-dark'),
+      theme: (currentThemeMode === 'light' ? 'kscc-light' : 'kscc-dark'),
       minimap: { enabled: false },
       fontSize: 13,
       fontFamily: "'JetBrains Mono', ui-monospace, Consolas, monospace",
@@ -321,7 +321,7 @@
       const m = monaco.editor.createModel(modified || '', lang);
       const diff = monaco.editor.createDiffEditor(document.getElementById('editor'), {
         automaticLayout: true,
-        theme: 'quark-dark',
+        theme: 'kscc-dark',
         renderSideBySide: true,
         overviewRulerLanes: 0,
         renderValidationDecorations: 'off'

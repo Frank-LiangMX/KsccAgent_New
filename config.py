@@ -1,5 +1,5 @@
 """
-Quark Agent - Configuration management
+Kscc Agent - Configuration management
 """
 
 from __future__ import annotations
@@ -53,6 +53,10 @@ class Config:
     ide_word_wrap: bool = True
     ide_minimap: bool = False
     ide_font_size: int = 13
+    # Agent / Skill / memory (local-only)
+    skills_enabled: bool = True
+    skill_debug_log: bool = False
+    memory_injection_enabled: bool = True
 
 
 @dataclass
@@ -148,6 +152,9 @@ def load_config() -> Config:
                 "ide_word_wrap",
                 "ide_minimap",
                 "ide_font_size",
+                "skills_enabled",
+                "skill_debug_log",
+                "memory_injection_enabled",
             ):
                 if key in data:
                     setattr(cfg, key, data[key])
@@ -201,6 +208,9 @@ def save_config(cfg: Config):
         "ide_word_wrap": cfg.ide_word_wrap,
         "ide_minimap": cfg.ide_minimap,
         "ide_font_size": cfg.ide_font_size,
+        "skills_enabled": cfg.skills_enabled,
+        "skill_debug_log": cfg.skill_debug_log,
+        "memory_injection_enabled": cfg.memory_injection_enabled,
     }
     CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 

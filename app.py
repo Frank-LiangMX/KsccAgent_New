@@ -1,18 +1,20 @@
 ﻿"""
-Quark Agent - PyQt6 Desktop Shell
+Kscc Agent - PyQt6 Desktop Shell
 """
 
-import asyncio, json, math, os, re, sys, threading, uuid
+import asyncio, json, math, os, re, subprocess, sys, threading, uuid
 import html as _html
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import memory_store
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QTextEdit, QPushButton, QTreeView, QScrollArea, QFrame, QFileDialog,
     QMenu, QSizePolicy, QToolBar, QStatusBar, QDialog, QFormLayout,
     QLineEdit, QComboBox, QDialogButtonBox, QSpinBox, QListWidget, QListWidgetItem, QCheckBox, QToolButton, QColorDialog, QFontComboBox,
+    QMessageBox,
     QStyledItemDelegate, QStyle, QStyleOptionViewItem, QWidgetAction, QTabBar, QStackedWidget, QToolTip, QListView,
 )
 from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QThread, pyqtSignal, QTimer, QSize, QUrl, QSettings
@@ -21,6 +23,7 @@ from PyQt6.QtGui import (
     QFont,
     QIcon,
     QImage,
+    QLinearGradient,
     QPainter,
     QPalette,
     QPen,
@@ -34,6 +37,7 @@ from PyQt6.QtGui import (
     QStandardItem,
     QTextOption,
 )
+import data_portability
 
 # 与 kscc UI composer 一致（chat_widgets.CODE_FONT_STACK）
 _CODE_FONT_STACK = (
@@ -45,6 +49,8 @@ APP_VERSION = "v1.4.0"
 SETTINGS_ICON_DARK = Path(__file__).parent / "setting.png"
 SETTINGS_ICON_LIGHT = Path(__file__).parent / "setting_black.png"
 ATTACHMENTS_DIR = Path(__file__).parent / "sessions" / "_attachments"
+MONACO_PACKAGE_JSON = Path(__file__).parent / "node_modules" / "monaco-editor" / "package.json"
+PROJECT_PACKAGE_JSON = Path(__file__).parent / "package.json"
 
 
 def _is_light_theme() -> bool:
@@ -65,6 +71,17 @@ def _tooltip_css(light: Optional[bool] = None) -> str:
 
 def _with_tooltip_style(css: str, light: Optional[bool] = None) -> str:
     return css + _tooltip_css(light)
+
+
+def _fmt_k(value) -> str:
+    """Format token/context counts in K units."""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return "—" if value is None else str(value)
+    k = n / 1000.0
+    s = f"{k:.2f}".rstrip("0").rstrip(".")
+    return f"{s}K"
 
 
 def _make_plus_icon(size=14, color="#d4d7dd"):
@@ -133,6 +150,7 @@ from config import (
 )
 from context import ContextTracker
 from session_store import SessionStore, Session
+from skills_ui import SkillSaveDialog, SkillsManagerDialog
 import re as _re
 
 from theme import (
@@ -507,6 +525,8 @@ class EditorTabHost(QWidget):
 
 # ── BubbleTextEdit (read-only; wheel scrolls outer QScrollArea, not inside bubble) ──
 class BubbleTextEdit(QTextEdit):
+    link_clicked = pyqtSignal(str)
+
     def __init__(self, scroll_area: Optional[QScrollArea] = None, parent=None):
         super().__init__(parent)
         self._scroll_area = scroll_area
@@ -514,7 +534,25 @@ class BubbleTextEdit(QTextEdit):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # 允许点击获取焦点后使用 Ctrl+C，同时保持只读
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+
+    def mouseReleaseEvent(self, event):
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                pos = event.position().toPoint()
+                href = self.anchorAt(pos)
+                if href:
+                    self.link_clicked.emit(str(href))
+                    event.accept()
+                    return
+        except Exception:
+            pass
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
         if self._scroll_area is not None:
@@ -592,6 +630,99 @@ class PreviewImageLabel(QLabel):
         super().mouseDoubleClickEvent(event)
 
 
+class SessionActivityBar(QWidget):
+    """Left indicator bar for session cards with running shimmer."""
+
+    def __init__(self, color: str, running: bool = False, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(3)
+        self.setMinimumHeight(30)
+        self._color = QColor(color)
+        self._running = False
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(40)
+        self._timer.timeout.connect(self._on_tick)
+        self.set_running(running)
+
+    def _on_tick(self):
+        self._phase = (self._phase + 0.03) % 1.0
+        self.update()
+
+    def set_running(self, running: bool):
+        self._running = bool(running)
+        if self._running:
+            if not self._timer.isActive():
+                self._timer.start()
+        else:
+            if self._timer.isActive():
+                self._timer.stop()
+            self._phase = 0.0
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        base = QColor(self._color)
+        if not self._running:
+            base.setAlpha(220)
+            p.fillRect(rect, base)
+            return
+        dim = QColor(self._color)
+        dim.setAlpha(90)
+        bright = QColor(self._color)
+        bright.setAlpha(240)
+        center = self._phase
+        a = max(0.0, center - 0.22)
+        c = min(1.0, center + 0.22)
+        g = QLinearGradient(0, 0, 0, rect.height())
+        g.setColorAt(0.0, dim)
+        g.setColorAt(a, dim)
+        g.setColorAt(center, bright)
+        g.setColorAt(c, dim)
+        g.setColorAt(1.0, dim)
+        p.fillRect(rect, g)
+
+
+class ElidedLabel(QLabel):
+    """A label that elides against its actual laid-out width."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__("", parent)
+        self._full_text = str(text or "")
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._refresh_text()
+
+    def set_full_text(self, text: str):
+        self._full_text = str(text or "")
+        self._refresh_text()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_text()
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(0)
+        return hint
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        hint.setWidth(0)
+        return hint
+
+    def _refresh_text(self):
+        width = self.contentsRect().width()
+        text = self._full_text
+        if width > 0:
+            text = QFontMetrics(self.font()).elidedText(text, Qt.TextElideMode.ElideRight, width)
+        if self.text() != text:
+            QLabel.setText(self, text)
+
+
 class ComposerAttachmentChip(QFrame):
     removed = pyqtSignal(str)
 
@@ -665,8 +796,9 @@ class FileAttachmentPill(QFrame):
 
 # ── ChatBubble ──────────────────────────────────────────────
 class ChatBubble(QFrame):
-    def __init__(self, role, text="", parent=None, scroll_area: Optional[QScrollArea] = None, attachments: Optional[list[dict]] = None):
+    def __init__(self, role, text="", parent=None, scroll_area: Optional[QScrollArea] = None, attachments: Optional[list[dict]] = None, model_label: str = ""):
         super().__init__(parent); self.role = role
+        self._raw_text = ""
         self._attachments = list(attachments or [])
         light = _is_light_theme()
         accent_hex = str(getattr(load_config(), "accent_color", "#5ee9ff") or "#5ee9ff").strip()
@@ -687,7 +819,11 @@ class ChatBubble(QFrame):
         il=QVBoxLayout(inner); il.setContentsMargins(12,8,12,8); il.setSpacing(4)
         names={"user":"You","assistant":"Kscc UI","tool":"Tool","error":"Error"}
         self.header=QLabel(names.get(role,role)); self.header.setFont(QFont("Segoe UI",10,QFont.Weight.Bold))
+        self.model_tag = QLabel(str(model_label or "").strip())
+        self.model_tag.setVisible(bool(str(model_label or "").strip()))
+        self.model_tag.setFont(QFont("Segoe UI", 9))
         self.body=BubbleTextEdit(scroll_area, self)
+        self.body.link_clicked.connect(self._on_link_clicked)
         self.attachments_wrap = QWidget()
         self.attachments_layout = QHBoxLayout(self.attachments_wrap)
         self.attachments_layout.setContentsMargins(0, 0, 0, 0)
@@ -710,6 +846,8 @@ class ChatBubble(QFrame):
             self.body.setStyleSheet(f"QTextEdit{{background:transparent;color:{text_user};border:none}}")
         elif role=="assistant":
             self.header.setStyleSheet(f"color:{hdr_assist};background:transparent;font-size:12px;font-weight:700;letter-spacing:0.04em")
+            tag_col = "#667085" if light else "#8b95a5"
+            self.model_tag.setStyleSheet(f"color:{tag_col};background:transparent;font-size:11px;font-weight:400;")
             inner.setStyleSheet(f"QFrame{{background:{panel_assist};border:none;border-radius:14px}}")
             self.body.setStyleSheet(f"QTextEdit{{background:transparent;color:{text_assist};border:none}}")
         elif role=="tool":
@@ -722,7 +860,13 @@ class ChatBubble(QFrame):
             self.header.setStyleSheet(f"color:{C_RED};background:transparent;font-size:10px;letter-spacing:0.06em")
             inner.setStyleSheet("QFrame{background:rgba(248,113,113,0.1);border:none;border-radius:12px}")
             self.body.setStyleSheet("QTextEdit{background:transparent;color:#fecaca;border:none}")
-        il.addWidget(self.header)
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.setSpacing(8)
+        head_row.addWidget(self.header, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        head_row.addWidget(self.model_tag, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        head_row.addStretch(1)
+        il.addLayout(head_row)
         il.addWidget(self.attachments_wrap)
         il.addWidget(self.body)
         if role=="user":
@@ -769,10 +913,13 @@ class ChatBubble(QFrame):
             plain = self.body.toPlainText()
             lines = plain.split("\n") if plain else [""]
             mw = max((fm.horizontalAdvance(L) for L in lines), default=40)
-            text_w = min(cap, max(56, mw + 28))
-            doc.setTextWidth(text_w)
-            h = math.ceil(float(doc.size().height())) + side_pad * 2
-            self.body.setFixedSize(int(text_w), int(max(h, 28)))
+            # Use doc width + widget gutter to avoid right-edge clipping on wrapped CJK text.
+            gutter = 14
+            doc_w = min(max(56, cap - gutter), max(56, mw + 18))
+            doc.setTextWidth(float(doc_w))
+            h = math.ceil(float(doc.size().height())) + side_pad * 2 + 2
+            widget_w = doc_w + gutter
+            self.body.setFixedSize(int(widget_w), int(max(h, 30)))
         else:
             bw = self.body.width()
             if bw > 80:
@@ -784,17 +931,20 @@ class ChatBubble(QFrame):
             self.body.setFixedHeight(int(max(h, 36)))
 
     def set_text(self, t):
+        self._raw_text = str(t or "")
         self.body.setVisible(bool(str(t or "").strip()))
         if self.role == "assistant":
-            self.body.setHtml(md_chat_to_html(t, light=_is_light_theme()))
+            self.body.setHtml(md_chat_to_html(self._raw_text, light=_is_light_theme()))
         else:
-            self.body.setPlainText(t)
+            self.body.setPlainText(self._raw_text)
         QTimer.singleShot(0, self._fit)
 
     def append_text(self, t):
         if self.role == "assistant":
-            cur = self.body.toPlainText() + t
-            self.body.setHtml(md_chat_to_html(cur, light=_is_light_theme()))
+            if not self.body.isVisible():
+                self.body.setVisible(True)
+            self._raw_text += str(t or "")
+            self.body.setHtml(md_chat_to_html(self._raw_text, light=_is_light_theme()))
             self.body.moveCursor(QTextCursor.MoveOperation.End)
             QTimer.singleShot(0, self._fit)
         else:
@@ -805,6 +955,25 @@ class ChatBubble(QFrame):
                 c.insertText(t)
             finally:
                 self.body.setReadOnly(True)
+
+    def _on_link_clicked(self, href: str):
+        href = str(href or "")
+        if not href.startswith("copycode:"):
+            return
+        try:
+            idx = int(href.split(":", 1)[1])
+        except Exception:
+            return
+        blocks = re.findall(r"```(?:\\w*)\\n(.*?)```", self._raw_text, flags=re.DOTALL)
+        if idx < 0 or idx >= len(blocks):
+            return
+        code = blocks[idx]
+        try:
+            cb = QApplication.clipboard()
+            cb.setText(code)
+            QToolTip.showText(QCursor.pos(), "Copied", self)
+        except Exception:
+            pass
 
     def _render_attachments(self):
         while self.attachments_layout.count():
@@ -1057,8 +1226,8 @@ class ContextRingWidget(QWidget):
             self._ratio = None
         cu = s.get("current_usage")
         lm = s.get("limit")
-        self._current = "—" if cu is None else str(cu)
-        self._limit = "—" if lm is None else str(lm)
+        self._current = _fmt_k(cu)
+        self._limit = _fmt_k(lm)
         self._refresh_tip()
         self.update()
 
@@ -1114,6 +1283,7 @@ class ContextRingWidget(QWidget):
 # ── ChatPanel ───────────────────────────────────────────────
 class ChatPanel(QWidget):
     send_message = pyqtSignal(str, object)
+    add_skill_requested = pyqtSignal()
     def __init__(self, parent=None):
         super().__init__(parent); self.setMinimumWidth(260)
         self._pending_attachments: list[dict] = []
@@ -1127,9 +1297,16 @@ class ChatPanel(QWidget):
         self.msg_layout.setSpacing(10); self.msg_layout.setContentsMargins(12,14,12,14)
         self.msg_layout.addStretch(); self.scroll.setWidget(self.msg_container)
         l.addWidget(self.scroll,1)
-        # Kscc status line
-        self.kscc_status_lbl=QLabel("")
-        self.kscc_status_lbl.setStyleSheet(f"color:{C_GREEN};font-size:10px;padding:4px 12px 2px 12px;background:transparent")
+        # Status line (aligned with composer input, accent colored)
+        self._status_base_text = ""
+        self._status_phase = 0
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(420)
+        self._status_timer.timeout.connect(self._tick_status)
+        self.kscc_status_lbl = QLabel("")
+        self.kscc_status_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.kscc_status_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.kscc_status_lbl.setContentsMargins(0, 0, 0, 0)
         self.kscc_status_lbl.hide()
         l.addWidget(self.kscc_status_lbl)
 
@@ -1225,7 +1402,18 @@ class ChatPanel(QWidget):
         input_wrap = QWidget()
         iw = QVBoxLayout(input_wrap)
         iw.setContentsMargins(12, 6, 12, 12)
-        iw.setSpacing(0)
+        iw.setSpacing(4)
+        self.save_skill_btn = QPushButton("Save Skill")
+        self.save_skill_btn.setObjectName("saveSkillBtn")
+        self.save_skill_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.save_skill_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.save_skill_btn.clicked.connect(self.add_skill_requested.emit)
+        self.save_skill_btn.hide()
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.addStretch(1)
+        top_bar.addWidget(self.save_skill_btn, 0, Qt.AlignmentFlag.AlignRight)
+        iw.addLayout(top_bar)
         iw.addWidget(self._input_card)
         l.addWidget(input_wrap)
         self._stream_bubble: Optional[ChatBubble] = None
@@ -1314,6 +1502,23 @@ class ChatPanel(QWidget):
                 "}"
                 f"QPushButton:hover {{ background:{send_hover}; }}"
                 f"QPushButton:disabled {{ background:{send_dis_bg}; color:{send_dis_fg}; }}"
+            )
+        )
+        if light:
+            chip_bg = "#ffefe5"
+            chip_fg = "#9a3412"
+            chip_hover = "#ffe1d2"
+        else:
+            chip_bg = "rgba(245,101,75,0.22)"
+            chip_fg = "#ffd4cc"
+            chip_hover = "rgba(245,101,75,0.30)"
+        self.save_skill_btn.setStyleSheet(
+            _with_tooltip_style(
+                "QPushButton{"
+                f"background:{chip_bg};color:{chip_fg};border:none;border-radius:10px;"
+                "padding:4px 10px;font-size:11px;font-weight:700;"
+                "}"
+                f"QPushButton:hover{{background:{chip_hover};}}"
             )
         )
         for meta in list(self._pending_attachments):
@@ -1465,8 +1670,45 @@ class ChatPanel(QWidget):
         return self._model_name
 
     def set_kscc_status(self, text: str):
-        self.kscc_status_lbl.setText(text)
-        self.kscc_status_lbl.setVisible(bool(text))
+        self._status_base_text = str(text or "").strip()
+        self._status_phase = 0
+        if not self._status_base_text:
+            self.kscc_status_lbl.hide()
+            self._status_timer.stop()
+            return
+        # show thinking animation prefix
+        if not self._status_timer.isActive():
+            self._status_timer.start()
+        self._apply_status_style()
+        self._render_status()
+        self.kscc_status_lbl.show()
+
+    def _apply_status_style(self):
+        light = _is_light_theme()
+        accent_hex = str(getattr(load_config(), "accent_color", "#5ee9ff") or "#5ee9ff").strip()
+        if not accent_hex.startswith("#"):
+            accent_hex = "#5ee9ff"
+        # remove any different background; keep transparent, align with input left padding
+        fg = accent_hex
+        pad_l = 22  # roughly aligns with composer card + inner padding
+        pad_r = 10
+        pad_t = 2
+        pad_b = 4
+        self.kscc_status_lbl.setStyleSheet(
+            f"QLabel{{color:{fg};font-size:10px;padding:{pad_t}px {pad_r}px {pad_b}px {pad_l}px;background:transparent;}}"
+        )
+
+    def _render_status(self):
+        dots = "." * (self._status_phase % 4)
+        prefix = f"Thinking{dots} "
+        self.kscc_status_lbl.setText(prefix + self._status_base_text)
+
+    def _tick_status(self):
+        if not self._status_base_text:
+            self._status_timer.stop()
+            return
+        self._status_phase += 1
+        self._render_status()
 
     def _pick_attachments(self):
         files, _ = QFileDialog.getOpenFileNames(self, "选择附件", "", "All Files (*.*)")
@@ -1534,17 +1776,22 @@ class ChatPanel(QWidget):
         if t or attachments:
             self.add_message("user", t, attachments=attachments)
             self.send_message.emit(t, attachments)
+            self.show_save_skill_prompt(False)
             self.input_edit.clear()
             self._pending_attachments.clear()
             self._refresh_attachments_row()
         self._adjust_input_height()
 
-    def add_message(self, role, text, attachments: Optional[list[dict]] = None): 
-        b=ChatBubble(role, text, scroll_area=self.scroll, attachments=attachments)
+    def show_save_skill_prompt(self, visible: bool, text: str = "Save Skill"):
+        self.save_skill_btn.setText(str(text or "Save Skill"))
+        self.save_skill_btn.setVisible(bool(visible))
+
+    def add_message(self, role, text, attachments: Optional[list[dict]] = None, model_label: str = ""): 
+        b=ChatBubble(role, text, scroll_area=self.scroll, attachments=attachments, model_label=model_label)
         self.msg_layout.insertWidget(max(0,self.msg_layout.count()-1),b)
         QTimer.singleShot(30,self._scroll); return b
-    def start_stream(self):
-        self._stream_bubble=self.add_message("assistant","")
+    def start_stream(self, model_label: str = ""):
+        self._stream_bubble=self.add_message("assistant","", model_label=model_label)
         self.send_btn.setEnabled(False); self.send_btn.hide()
         self.stop_btn.show()
 
@@ -1552,7 +1799,12 @@ class ChatPanel(QWidget):
         """流式追加助手正文（由 AgentWorker.text_delta 调用）。"""
         if not text or not self._stream_bubble:
             return
-        self._stream_bubble.append_text(text)
+        try:
+            self._stream_bubble.append_text(text)
+        except RuntimeError:
+            # 气泡控件已被销毁（如切会话/新建会话后仍收到旧流式信号）
+            self._stream_bubble = None
+            return
         QTimer.singleShot(40, self._scroll)
 
     def end_stream(self):
@@ -1562,16 +1814,25 @@ class ChatPanel(QWidget):
 
     def add_tool(self, name, preview):
         if self._stream_bubble and name not in ("edit_file","Write","Edit"):
-            self._stream_bubble.append_text(f"\n· Tool · {preview}\n")
+            try:
+                self._stream_bubble.append_text(f"\n· Tool · {preview}\n")
+            except RuntimeError:
+                self._stream_bubble = None
 
     def add_result(self, result, error=False):
         if self._stream_bubble:
             marker = "Failed ·" if error else "Done ·"
-            self._stream_bubble.append_text(f"{marker} {result[:400]}\n")
+            try:
+                self._stream_bubble.append_text(f"{marker} {result[:400]}\n")
+            except RuntimeError:
+                self._stream_bubble = None
 
     def add_error(self, t):
         if self._stream_bubble:
-            self._stream_bubble.append_text(f"\nError · {t}\n")
+            try:
+                self._stream_bubble.append_text(f"\nError · {t}\n")
+            except RuntimeError:
+                self._stream_bubble = None
             self.end_stream()
         else:
             self.add_message("error", t)
@@ -1778,12 +2039,25 @@ class AgentWorker(QThread):
     confirm_request = pyqtSignal(str, str, str)  # path, old, new (edit_file review)
     kscc_status  = pyqtSignal(str)       # kscc thinking/tool status
     context_info = pyqtSignal(str)
+    skill_info   = pyqtSignal(str)
+    skill_draft  = pyqtSignal(str)
     done         = pyqtSignal(str, int, str)
     error        = pyqtSignal(str)
     file_modified= pyqtSignal(str, str)
 
     def __init__(self, agent, prompt, attachments=None):
         super().__init__(); self.agent=agent; self.prompt=prompt; self.attachments=attachments or []
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+        self.requestInterruption()
+        try:
+            if getattr(self.agent, "_confirm_event", None):
+                self.agent._confirm_result = False
+                self.agent._confirm_event.set()
+        except Exception:
+            pass
 
     @staticmethod
     def _thinking_status(text: str) -> str:
@@ -1817,6 +2091,8 @@ class AgentWorker(QThread):
         async def _r():
             try:
                 async for e in self.agent.run(self.prompt, self.attachments):
+                    if self._stop_requested or self.isInterruptionRequested():
+                        break
                     t=e.get('type','')
                     if t=='text_delta': self.text_delta.emit(e.get('text',''))
                     elif t=='tool_call':
@@ -1838,6 +2114,10 @@ class AgentWorker(QThread):
                         if e.get('name','') in ('write_file','edit_file') and not e.get('error'):
                             pass  # file_modified handled by main
                     elif t=='context': self.context_info.emit(json.dumps(e.get('summary',{})))
+                    elif t in ('skill_match', 'skill_miss', 'skill_ambiguous', 'skill_status'):
+                        self.skill_info.emit(json.dumps(e, ensure_ascii=False))
+                    elif t=='skill_save_draft':
+                        self.skill_draft.emit(json.dumps(e.get('draft', {}), ensure_ascii=False))
                     elif t=='confirm':
                         # 代码审阅
                         tc=e.get('tool_call',{}); a=e.get('args',{})
@@ -1845,7 +2125,9 @@ class AgentWorker(QThread):
                         # 等待 approve/reject (blocking)
                         self.agent._confirm_event.clear()
                         self.agent._confirm_event.wait()
-                    elif t=='done': self.done.emit(e.get('text',''),e.get('turns',0),json.dumps(e.get('context',{})))
+                    elif t=='done':
+                        if not (self._stop_requested or self.isInterruptionRequested()):
+                            self.done.emit(e.get('text',''),e.get('turns',0),json.dumps(e.get('context',{})))
                     elif t=='error': self.error.emit(e.get('content',''))
             except Exception as ex: self.error.emit(f"{type(ex).__name__}: {ex}")
         try: asyncio.run(_r())
@@ -1860,6 +2142,8 @@ class SettingsPage(QWidget):
         super().__init__(parent); self.cfg=cfg; self.setMinimumWidth(720)
         self.setObjectName("SettingsPage")
         self._model_row_prev = -1
+        self._monaco_installing = False
+        self._monaco_status_tip = ""
         self._light = str(getattr(cfg, "theme", "dark")).lower() == "light"
         self._txt = "#0f172a" if self._light else C_TEXT
         self._dim = "#64748b" if self._light else C_DIM
@@ -1881,7 +2165,7 @@ class SettingsPage(QWidget):
             f"QListWidget::item{{padding:10px 12px;border-radius:10px;text-align:left;}}"
             f"QListWidget::item:selected{{background:{self._panel_hi};color:{self._txt}}}"
         )
-        for item in ("外观", "模型与API", "IDE"):
+        for item in ("外观", "模型与API", "IDE", "Agent"):
             self.nav.addItem(QListWidgetItem(item))
         self.nav.setCurrentRow(0)
         nav_l.addWidget(self.nav, 1)
@@ -1903,6 +2187,7 @@ class SettingsPage(QWidget):
         self._build_appearance_page()
         self._build_model_api_page()
         self._build_ide_page()
+        self._build_agent_page()
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
         self._apply_page_theme()
         self.reload_from_config()
@@ -1954,7 +2239,7 @@ class SettingsPage(QWidget):
                 f"QListWidget::item:hover{{background:{c_hover};color:{c_fg};}}"
                 f"QListWidget::item:selected{{background:{c_select_bg};color:{c_select_fg};}}"
             )
-        for btn_name in ("add_btn", "del_btn", "set_active_btn"):
+        for btn_name in ("add_btn", "del_btn", "set_active_btn", "monaco_check_btn", "monaco_install_btn"):
             if hasattr(self, btn_name):
                 getattr(self, btn_name).setStyleSheet(
                     _with_tooltip_style(
@@ -1975,6 +2260,8 @@ class SettingsPage(QWidget):
             )
         if hasattr(self, "accent_btn"):
             self._refresh_accent_button()
+        if hasattr(self, "monaco_status"):
+            self._refresh_monaco_dependency_ui()
 
     def _style_combo(self, combo: QComboBox):
         c_fg = "#4f5153" if self._light else "#ffffff"
@@ -2194,13 +2481,149 @@ class SettingsPage(QWidget):
         self.ide_wrap = QCheckBox("自动换行")
         self.ide_minimap = QCheckBox("显示 minimap")
         self.ide_font_size = self._make_size_combo(list(range(10, 25)))
-        self.ws_ed = QLineEdit()
-        self._add_setting_card(form, "Workspace", "项目工作目录", self.ws_ed)
+        self.monaco_status = QLabel()
+        self.monaco_status.setWordWrap(True)
+        self.monaco_check_btn = QPushButton("检查依赖")
+        self.monaco_install_btn = QPushButton("安装 Monaco")
+        self.monaco_check_btn.clicked.connect(self._refresh_monaco_dependency_ui)
+        self.monaco_install_btn.clicked.connect(self._install_monaco_dependency)
+        monaco_row = QWidget()
+        monaco_row_l = QHBoxLayout(monaco_row)
+        monaco_row_l.setContentsMargins(0, 0, 0, 0)
+        monaco_row_l.setSpacing(10)
+        monaco_row_l.addWidget(self.monaco_status, 1, Qt.AlignmentFlag.AlignVCenter)
+        monaco_row_l.addWidget(self.monaco_check_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        monaco_row_l.addWidget(self.monaco_install_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self._add_setting_card(form, "自动换行", "编辑器长行自动折行显示", self.ide_wrap)
         self._add_setting_card(form, "显示 minimap", "在编辑器右侧显示代码缩略图", self.ide_minimap)
         self._add_setting_card(form, "编辑器字号", "Monaco 编辑器字体大小", self.ide_font_size)
+        self._add_setting_card(form, "Monaco 依赖", "按需检查并安装 Monaco 编辑器依赖；未安装时用户可在这里手动安装。", monaco_row)
+
+        data_row = QWidget()
+        data_row_l = QHBoxLayout(data_row)
+        data_row_l.setContentsMargins(0, 0, 0, 0)
+        data_row_l.setSpacing(10)
+        self.export_data_btn = QPushButton("导出数据")
+        self.import_data_btn = QPushButton("导入数据")
+        self.export_data_btn.clicked.connect(self._export_local_data)
+        self.import_data_btn.clicked.connect(self._import_local_data)
+        data_row_l.addWidget(self.export_data_btn)
+        data_row_l.addWidget(self.import_data_btn)
+        data_row_l.addStretch(1)
+        self._add_setting_card(form, "本地数据迁移", "导出/导入 skills 与 memory（zip）。用于备份、换机器迁移。", data_row)
+
         v.addWidget(box); v.addStretch(1)
         self.pages.addWidget(page)
+
+    def _build_agent_page(self):
+        page = QWidget(); v = QVBoxLayout(page); v.setContentsMargins(0,0,0,0); v.setSpacing(10)
+        box, form = self._make_group("Agent", "Agent 行为与本地能力增强设置")
+        self.skills_enabled = QCheckBox("启用 Skill 匹配")
+        self.skill_debug_log = QCheckBox("记录 Skill 调试日志")
+        self.memory_injection_enabled = QCheckBox("启用本地记忆注入")
+        self._add_setting_card(form, "Skill 匹配", "关闭后将跳过本地 skill 召回，仅走普通对话。", self.skills_enabled)
+        self._add_setting_card(form, "Skill 调试日志", "写入 logs/skill_debug.log，记录命中/未命中原因。", self.skill_debug_log)
+        self._add_setting_card(form, "本地记忆注入", "将 memory/ 中规则、事实、归档摘要注入系统提示词。", self.memory_injection_enabled)
+        v.addWidget(box); v.addStretch(1)
+        self.pages.addWidget(page)
+
+    def _export_local_data(self):
+        try:
+            path, _ = QFileDialog.getSaveFileName(self, "导出本地数据", str(Path(__file__).parent / "kscc-data.zip"), "Zip (*.zip)")
+            if not path:
+                return
+            out = data_portability.export_zip(path)
+            QToolTip.showText(self.mapToGlobal(self.rect().center()), f"已导出: {Path(out).name}", self)
+        except Exception as e:
+            QToolTip.showText(self.mapToGlobal(self.rect().center()), f"导出失败: {e}", self)
+
+    def _import_local_data(self):
+        try:
+            path, _ = QFileDialog.getOpenFileName(self, "导入本地数据", str(Path(__file__).parent), "Zip (*.zip)")
+            if not path:
+                return
+            counts = data_portability.import_zip(path)
+            msg = f"导入完成: +skills {counts.get('skills_added',0)} / upd {counts.get('skills_updated',0)}"
+            QToolTip.showText(self.mapToGlobal(self.rect().center()), msg, self)
+        except Exception as e:
+            QToolTip.showText(self.mapToGlobal(self.rect().center()), f"导入失败: {e}", self)
+
+    def _read_monaco_dependency_info(self) -> tuple[bool, str]:
+        if not MONACO_PACKAGE_JSON.exists():
+            return False, ""
+        try:
+            payload = json.loads(MONACO_PACKAGE_JSON.read_text("utf-8", errors="replace"))
+        except Exception:
+            return True, ""
+        version = str(payload.get("version") or "").strip()
+        return True, version
+
+    def _refresh_monaco_dependency_ui(self):
+        if not hasattr(self, "monaco_status"):
+            return
+        installed, version = self._read_monaco_dependency_info()
+        if self._monaco_installing:
+            status_text = "正在安装 Monaco 依赖..."
+            status_color = "#2563eb" if self._light else "#7dd3fc"
+        elif installed:
+            version_text = f" · v{version}" if version else ""
+            status_text = f"已安装{version_text}"
+            status_color = "#0f766e" if self._light else "#5eead4"
+        else:
+            status_text = "未安装，使用 Monaco IDE 前需先安装 npm 依赖"
+            status_color = "#b45309" if self._light else "#fbbf24"
+        self.monaco_status.setText(status_text)
+        self.monaco_status.setStyleSheet(f"color:{status_color};font-size:12px;background:transparent;")
+        self.monaco_status.setToolTip(self._monaco_status_tip or status_text)
+        install_text = "安装中..." if self._monaco_installing else ("重装 Monaco" if installed else "安装 Monaco")
+        self.monaco_install_btn.setText(install_text)
+        self.monaco_install_btn.setEnabled(not self._monaco_installing)
+        self.monaco_check_btn.setEnabled(not self._monaco_installing)
+        self.monaco_install_btn.setToolTip("执行 npm install，安装或重装 Monaco 相关依赖")
+        self.monaco_check_btn.setToolTip("重新检查 node_modules 中的 Monaco 安装状态")
+
+    def _finish_monaco_install(self, ok: bool, message: str):
+        self._monaco_installing = False
+        self._monaco_status_tip = message.strip() or ("Monaco 依赖安装完成" if ok else "Monaco 依赖安装失败")
+        self._refresh_monaco_dependency_ui()
+
+    def _install_monaco_dependency(self):
+        if self._monaco_installing:
+            return
+        self._monaco_installing = True
+        self._monaco_status_tip = "正在执行 npm install ..."
+        self._refresh_monaco_dependency_ui()
+
+        def worker():
+            npm_cmd = "npm.cmd" if os.name == "nt" else "npm"
+            try:
+                if not PROJECT_PACKAGE_JSON.exists():
+                    raise FileNotFoundError("未找到 package.json，无法安装 Monaco 依赖。")
+                result = subprocess.run(
+                    [npm_cmd, "install"],
+                    cwd=str(Path(__file__).parent),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=900,
+                    check=False,
+                )
+                output = (result.stdout or "").strip()
+                err = (result.stderr or "").strip()
+                detail = (output + "\n" + err).strip()
+                if result.returncode == 0:
+                    msg = detail or "npm install 已完成。"
+                    QTimer.singleShot(0, lambda m=msg: self._finish_monaco_install(True, m))
+                else:
+                    msg = detail or f"npm install 失败，退出码 {result.returncode}"
+                    QTimer.singleShot(0, lambda m=msg: self._finish_monaco_install(False, m))
+            except FileNotFoundError as exc:
+                QTimer.singleShot(0, lambda m=f"{exc}\n请先安装 Node.js / npm 并确保 npm 在 PATH 中。": self._finish_monaco_install(False, m))
+            except Exception as exc:
+                QTimer.singleShot(0, lambda m=str(exc): self._finish_monaco_install(False, m))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def reload_from_config(self):
         cfg = self.cfg
@@ -2214,10 +2637,13 @@ class SettingsPage(QWidget):
         self.accent_value.setText(getattr(cfg, "accent_color", "#5ee9ff"))
         self.ide_wrap.setChecked(bool(getattr(cfg, "ide_word_wrap", True)))
         self.ide_minimap.setChecked(bool(getattr(cfg, "ide_minimap", False)))
+        self.skills_enabled.setChecked(bool(getattr(cfg, "skills_enabled", True)))
+        self.skill_debug_log.setChecked(bool(getattr(cfg, "skill_debug_log", False)))
+        self.memory_injection_enabled.setChecked(bool(getattr(cfg, "memory_injection_enabled", True)))
         self.ide_font_size.setCurrentText(str(int(getattr(cfg, "ide_font_size", 13))))
-        self.ws_ed.setText(cfg.workspace)
         for combo in (self.theme_combo, self.ui_font_combo, self.ui_font_size, self.code_font_combo, self.code_font_size, self.ide_font_size):
             self._style_combo(combo)
+        self._refresh_monaco_dependency_ui()
         self._refresh_models_list()
 
     def _model_entries(self) -> list[tuple[str, object]]:
@@ -2282,7 +2708,8 @@ class SettingsPage(QWidget):
             m = self.cfg.openai_models[int(ref)]
             ctx, out = get_effective_model_limits(m.model, "openai", m.context_limit, m.max_output_tokens)
             self.m_enabled.setChecked(bool(m.enabled))
-            self.m_model.setText(m.model)
+            # UI label is "模型名称"; keep it aligned with list display name.
+            self.m_model.setText(m.name or m.model)
             self.m_key.setText(m.api_key)
             self.m_url.setText(m.base_url)
             self.m_ctx_limit.setValue(ctx)
@@ -2315,7 +2742,13 @@ class SettingsPage(QWidget):
             return
         m = self.cfg.openai_models[int(ref)]
         m.enabled = self.m_enabled.isChecked()
-        m.model = self.m_model.text().strip() or m.model
+        new_name = self.m_model.text().strip() or m.name or m.model
+        old_name = m.name
+        # In current UI, "模型名称" is both display name and model id.
+        m.name = new_name
+        m.model = new_name
+        if self.cfg.openai_active == old_name:
+            self.cfg.openai_active = new_name
         m.api_key = self.m_key.text().strip()
         m.base_url = (self.m_url.text().strip() or "https://api.openai.com/v1")
         default_ctx, default_out = get_effective_model_limits(m.model, "openai")
@@ -2361,8 +2794,10 @@ class SettingsPage(QWidget):
         self.cfg.accent_color = self.accent_value.text().strip() or "#5ee9ff"
         self.cfg.ide_word_wrap = self.ide_wrap.isChecked()
         self.cfg.ide_minimap = self.ide_minimap.isChecked()
+        self.cfg.skills_enabled = self.skills_enabled.isChecked()
+        self.cfg.skill_debug_log = self.skill_debug_log.isChecked()
+        self.cfg.memory_injection_enabled = self.memory_injection_enabled.isChecked()
         self.cfg.ide_font_size = int(self.ide_font_size.currentText() or 13)
-        self.cfg.workspace = self.ws_ed.text().strip()
         if self.cfg.openai_active and not any(m.name == self.cfg.openai_active and m.enabled for m in self.cfg.openai_models):
             enabled = [m for m in self.cfg.openai_models if m.enabled]
             self.cfg.openai_active = enabled[0].name if enabled else ""
@@ -2380,6 +2815,8 @@ class MainWindow(QMainWindow):
         self._running=False; self._cur_session:Optional[Session]=None
         self._session_group_collapsed: dict[str, bool] = {}
         self._pending_user_message_meta: Optional[dict] = None
+        self._pending_skill_draft: Optional[dict] = None
+        self._last_agent_prompt: str = ""
         ip=Path(__file__).parent/"icon.png"
         if ip.exists(): self.setWindowIcon(QIcon(str(ip)))
         app0 = QApplication.instance()
@@ -2651,6 +3088,12 @@ class MainWindow(QMainWindow):
         self.settings_btn.setIconSize(QSize(18,18))
         self.settings_btn.setMinimumHeight(34)
         self.settings_btn.clicked.connect(self._settings); tb.addWidget(self.settings_btn)
+        self.skills_btn=QPushButton("Skills")
+        self.skills_btn.setIcon(quark_icon("bullet_list", 18))
+        self.skills_btn.setIconSize(QSize(18,18))
+        self.skills_btn.setMinimumHeight(34)
+        self.skills_btn.setToolTip("管理本地 Skills")
+        self.skills_btn.clicked.connect(self._open_skills_manager); tb.addWidget(self.skills_btn)
         r.addWidget(tb)
 
         # Splitter：IDE 下为 [文件树 | 编辑器 | 会话侧栏+聊天]；Solo 下隐藏文件树，仅 [会话侧栏+聊天]
@@ -2691,6 +3134,7 @@ class MainWindow(QMainWindow):
         sl.addWidget(self.sess_scroll,1)
 
         self.chat=ChatPanel(); self.chat.send_message.connect(self._on_send)
+        self.chat.add_skill_requested.connect(self._open_skill_save_dialog)
         self.chat.stop_btn.clicked.connect(self._on_stop)
         self._init_chat_selectors()
 
@@ -2932,11 +3376,20 @@ class MainWindow(QMainWindow):
             self.chat.set_active("OpenAI", (self.chat._model_map.get("OpenAI") or ["Add in Settings..."])[0])
 
     def _chg_ws(self):
-        p=QFileDialog.getExistingDirectory(self,"Select Workspace",self.config.workspace)
+        base = self._cur_session.workspace if self._cur_session and self._cur_session.workspace else self.config.workspace
+        p=QFileDialog.getExistingDirectory(self,"Select Workspace",base)
         if p:
-            self.config.workspace=os.path.abspath(p); self.ws_lbl.setText(self._short(p,30))
-            self.file_tree.set_workspace(p)
+            ap = os.path.abspath(p)
+            # Apply to current session (not a global setting UI)
+            if self._cur_session is not None:
+                self._cur_session.workspace = ap
+                self.store.save(self._cur_session)
+                self._refresh_sessions()
+            # Keep config.workspace as default for new sessions only
+            self.config.workspace = ap
             save_config(self.config)
+            self.ws_lbl.setText(self._short(ap,30))
+            self.file_tree.set_workspace(ap)
 
     @staticmethod
     def _short(t,n): return t if len(t)<=n else "..."+t[-(n-3):]
@@ -2992,6 +3445,7 @@ class MainWindow(QMainWindow):
             self.sess_layout.addWidget(head)
 
             group_body = QWidget()
+            group_body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             group_body_layout = QVBoxLayout(group_body)
             group_body_layout.setContentsMargins(0, 0, 0, 0)
             group_body_layout.setSpacing(0)
@@ -3009,32 +3463,47 @@ class MainWindow(QMainWindow):
                         if m:
                             short_updated = f"{m.group(2)}-{m.group(3)} {m.group(4)}"
                 card=QFrame()
+                card_margin_x = 6
+                card_pad = 2
+                row_left = 5
+                row_right = 8
+                row_gap = 3
+                bar_width = 3
                 card.setStyleSheet(
-                    f"QFrame{{background:{card_sel if selected else card_bg};border:none;border-radius:10px;margin:3px 8px;padding:2px}}"
+                    f"QFrame{{background:{card_sel if selected else card_bg};border:none;border-radius:10px;margin:3px {card_margin_x}px;padding:{card_pad}px}}"
                     f"QFrame:hover{{background:{card_sel if selected else card_hover}}}"
                     f"QLabel{{background:transparent}}"
                 )
                 card.setCursor(Qt.CursorShape.PointingHandCursor)
+                card.setMinimumWidth(0)
+                card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
                 card.mousePressEvent=lambda e,si=sid: self._on_sess_click(e,si)
                 card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
                 card.setProperty("sid",sid)
                 card.customContextMenuRequested.connect(lambda pos: self._sess_menu(pos))
-                row=QHBoxLayout(card); row.setContentsMargins(8,8,10,8); row.setSpacing(8)
+                row=QHBoxLayout(card); row.setContentsMargins(row_left,8,row_right,8); row.setSpacing(row_gap)
                 bar = QFrame()
-                bar.setFixedWidth(3)
-                bar.setMinimumHeight(30)
-                bar.setStyleSheet(
-                    f"QFrame{{background:{indicator if selected else 'transparent'};border:none;border-radius:2px;}}"
-                )
+                if selected:
+                    is_running = bool(
+                        self._running
+                        and self._cur_session
+                        and self._cur_session.id == sid
+                    )
+                    bar = SessionActivityBar(indicator, running=is_running)
+                else:
+                    bar = QFrame()
+                    bar.setFixedWidth(bar_width)
+                    bar.setMinimumHeight(30)
+                    bar.setStyleSheet("QFrame{background:transparent;border:none;border-radius:2px;}")
                 row.addWidget(bar)
                 body = QWidget()
+                body.setMinimumWidth(0)
+                body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
                 hl=QVBoxLayout(body); hl.setContentsMargins(0,0,0,0); hl.setSpacing(2)
                 title_font = QFont("Segoe UI", 12, QFont.Weight.DemiBold if selected else QFont.Weight.Medium)
-                title_metrics = QFontMetrics(title_font)
-                title_width = max(96, self.session_panel.width() - 84)
-                title_text = title_metrics.elidedText(str(title or "Untitled"), Qt.TextElideMode.ElideRight, title_width)
-                tlab=QLabel(title_text); tlab.setStyleSheet(f"color:{title_col};font-size:12px;font-weight:{700 if selected else 500};background:transparent")
+                tlab=ElidedLabel(str(title or "Untitled")); tlab.setStyleSheet(f"color:{title_col};font-size:12px;font-weight:{700 if selected else 500};background:transparent")
                 tlab.setFont(title_font)
+                tlab.set_full_text(str(title or "Untitled"))
                 tlab.setToolTip(str(title or "Untitled"))
                 hl.addWidget(tlab)
                 tl=QLabel(f"msgs: {cnt}  {short_updated}")
@@ -3080,10 +3549,29 @@ class MainWindow(QMainWindow):
         if event.button()!=Qt.MouseButton.LeftButton: return
         self._load_session(sid)
 
+    def _stop_worker_for_navigation(self):
+        """切换/新建会话前停止当前任务，避免旧信号继续写入已销毁控件。"""
+        if self._worker and self._worker.isRunning():
+            self._worker.stop()
+            self._worker.wait(2000)
+            if self._worker.isRunning():
+                self._worker.terminate()
+                self._worker.wait(2000)
+        self._running = False
+        self._ctx_bind_sid = None
+        self._pending_user_message_meta = None
+        self.chat.end_stream()
+        self._dispose_agent_runtime()
+
     def _load_session(self, sid):
+        self._stop_worker_for_navigation()
         session=self.store.load(sid)
         if not session: return
-        self._cur_session=session; self._agent=None; self._worker=None; self._running=False
+        self._cur_session=session
+        self._agent=None
+        self._worker=None; self._running=False
+        self._pending_skill_draft = None
+        self.chat.show_save_skill_prompt(False)
         self._refresh_sessions()
         self.editor_tabs.clear_all_tabs()
         while self.chat.msg_layout.count():
@@ -3096,7 +3584,7 @@ class MainWindow(QMainWindow):
             if r=="user":
                 self.chat.add_message("user", self._message_display_text(m), attachments=m.get("attachments") or [])
             elif r=="assistant":
-                if c: self.chat.add_message("assistant",str(c))
+                if c: self.chat.add_message("assistant",str(c), model_label=str(m.get("model_label", "") or ""))
                 for tc in m.get("tool_calls",[]):
                     fn=tc.get("function",{}); n=fn.get("name","")
                     if n=="edit_file":
@@ -3105,8 +3593,18 @@ class MainWindow(QMainWindow):
                         if a.get("path"):
                             self.chat.add_diff(a["path"], a.get("old_string",""), a.get("new_string",""))
             elif r=="tool": pass
+        # Restore per-session workspace + model selection
         if session.workspace and os.path.isdir(session.workspace):
-            self.file_tree.set_workspace(session.workspace)
+            self.config.workspace = os.path.abspath(session.workspace)
+            self.ws_lbl.setText(self._short(self.config.workspace,30))
+            self.file_tree.set_workspace(self.config.workspace)
+        if session.backend:
+            self.config.backend = str(session.backend)
+        if session.backend == "kscc" and session.model:
+            self.config.kscc_model = str(session.model)
+        if session.backend == "openai" and session.model:
+            self.config.openai_active = str(session.model)
+        self._init_chat_selectors()
         self.slbl.setText(f"Session: {session.title[:36]}" if session.title.strip() else "Session")
         self._ctx_bind_sid = None
         self._pending_user_message_meta = None
@@ -3124,7 +3622,10 @@ class MainWindow(QMainWindow):
             self.store.delete(sid); self._refresh_sessions()
 
     def _new_session(self):
+        self._stop_worker_for_navigation()
         self._cur_session=None; self._agent=None; self._worker=None; self._running=False
+        self._pending_skill_draft = None
+        self.chat.show_save_skill_prompt(False)
         self.editor_tabs.clear_all_tabs()
         while self.chat.msg_layout.count():
             item = self.chat.msg_layout.takeAt(0)
@@ -3146,8 +3647,26 @@ class MainWindow(QMainWindow):
         attachments_meta = list(attachments_meta or [])
         prompt = str(prompt or "")
         agent_prompt = prompt if prompt.strip() else ("请查看附件。" if attachments_meta else prompt)
+        self._last_agent_prompt = agent_prompt
         backend = self.chat.current_backend_label()
         model = self.chat.current_model_name()
+        prev_backend = (self._cur_session.backend if self._cur_session else "") or ""
+        prev_model = (self._cur_session.model if self._cur_session else "") or ""
+        next_backend_key = "kscc" if backend == "Kscc" else "openai"
+        switched_backend = bool(prev_backend and prev_backend != next_backend_key)
+        switched_model = bool(prev_model and prev_model != model)
+        switched_runtime = bool(prev_backend and (switched_backend or switched_model))
+
+        if switched_backend:
+            anchor = self._build_backend_switch_anchor()
+            if anchor:
+                agent_prompt = (
+                    f"{agent_prompt}\n\n"
+                    "[Backend switch context anchor]\n"
+                    "You are continuing the same user session after switching model backend.\n"
+                    "Use this anchor to preserve continuity, and prioritize the latest user request if conflicts exist.\n"
+                    f"{anchor}"
+                )
 
         if backend == "Kscc":
             self.config.backend = "kscc"; self.config.kscc_model = model
@@ -3157,14 +3676,38 @@ class MainWindow(QMainWindow):
             self.editor._js("window._enableCompletions()")
 
         self.model_lbl.setText(f"{backend}/{model}")
+        self._refresh_sessions()
 
         if self._cur_session is None:
             self._cur_session=self.store.create(title="",workspace=self.config.workspace,mode=mode)
+        # Persist per-session selection
+        self._cur_session.workspace = os.path.abspath(self.config.workspace)
+        self._cur_session.backend = "kscc" if backend == "Kscc" else "openai"
+        self._cur_session.model = model
+        self.store.save(self._cur_session)
         self._pending_user_message_meta = {
             "display_text": prompt,
             "attachments": [dict(a) for a in attachments_meta],
         }
-        self.chat.send_btn.setEnabled(False); self.chat.start_stream(); self.slbl.setText("Running...")
+        if switched_runtime and self._cur_session is not None:
+            evt = {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "from_backend": prev_backend,
+                "from_model": prev_model,
+                "to_backend": next_backend_key,
+                "to_model": model,
+            }
+            try:
+                self._cur_session.model_switches.append(evt)
+            except Exception:
+                self._cur_session.model_switches = [evt]
+            self.chat.add_message(
+                "tool",
+                f"Model switched: {prev_backend}/{prev_model or '-'} -> {next_backend_key}/{model or '-'}",
+            )
+
+        self.chat.send_btn.setEnabled(False); self.chat.start_stream(model_label=f"{backend}/{model}"); self.slbl.setText("Running...")
+        self._dispose_agent_runtime()
         try:
             rmsgs=self._cur_session.messages if self._cur_session.messages else None
             agent=Agent(config=self.config,mode=mode,resume_messages=rmsgs)
@@ -3181,11 +3724,44 @@ class MainWindow(QMainWindow):
         w.kscc_status.connect(self.chat.set_kscc_status)
         w.confirm_request.connect(self._on_confirm)
         w.context_info.connect(self._on_ctx)
+        w.skill_info.connect(self._on_skill_info)
+        w.skill_draft.connect(self._on_skill_draft)
         w.done.connect(self._on_done)
         w.error.connect(self._on_err)
         w.file_modified.connect(self._on_fmod)
         w.finished.connect(self._on_fin)
         w.start()
+        if switched_runtime:
+            self.slbl.setText(
+                f"Backend switched: {prev_backend}/{prev_model or '-'} -> {next_backend_key}/{model or '-'} (context continuity: best-effort)"
+            )
+
+    def _build_backend_switch_anchor(self) -> str:
+        """
+        Build a compact anchor from recent session turns to stabilize
+        continuity when switching between kscc/openai backends.
+        """
+        sess = self._cur_session
+        if not sess or not isinstance(sess.messages, list):
+            return ""
+        rows: list[str] = []
+        for msg in sess.messages:
+            role = str(msg.get("role", "") or "")
+            if role not in ("user", "assistant"):
+                continue
+            if role == "user":
+                text = str(msg.get("display_text", msg.get("content", "")) or "").strip()
+            else:
+                text = str(msg.get("content", "") or "").strip()
+            if not text:
+                continue
+            text = text.replace("\n", " ")
+            if len(text) > 180:
+                text = text[:177] + "..."
+            rows.append(f"- {role}: {text}")
+        if not rows:
+            return ""
+        return "Recent turns:\n" + "\n".join(rows[-6:])
 
     def _on_ctx(self, sj):
         try:
@@ -3207,26 +3783,96 @@ class MainWindow(QMainWindow):
         self.chat.end_stream(); self.chat.set_kscc_status("")
         self.slbl.setText(f"Done - {turns} turns")
         try:
-            c=json.loads(cj); self.tlbl.setText(f"in:{c.get('total_input','?')} out:{c.get('total_output','?')}")
+            c=json.loads(cj)
+            self.tlbl.setText(f"in:{_fmt_k(c.get('total_input'))} out:{_fmt_k(c.get('total_output'))}")
         except: pass
         self._save()
+        if bool(getattr(self.config, "memory_injection_enabled", True)):
+            try:
+                memory_store.append_archive(
+                    session_id=self._cur_session.id if self._cur_session else "",
+                    title=self._cur_session.title if self._cur_session else "",
+                    user_prompt=self._last_agent_prompt,
+                    summary=text,
+                    turns=turns,
+                    workspace=self.config.workspace,
+                )
+            except Exception:
+                pass
 
     def _on_stop(self):
         if self._worker and self._worker.isRunning():
-            self._worker.terminate(); self._worker.wait(2000)
+            self._worker.stop(); self._worker.wait(2000)
+            if self._worker.isRunning():
+                self._worker.terminate(); self._worker.wait(2000)
         self._ctx_bind_sid = None
         self._pending_user_message_meta = None
         self._running=False; self.chat.end_stream()
+        self._dispose_agent_runtime()
+        self._refresh_sessions()
         self.slbl.setText("Stopped")
 
     def _on_err(self, t):
         self._ctx_bind_sid = None
         self._pending_user_message_meta = None
         self.chat.add_error(t); self.chat.end_stream(); self.slbl.setText("Error"); self._running=False
+        self._dispose_agent_runtime()
+        self._refresh_sessions()
+
+    def _on_skill_info(self, payload: str):
+        try:
+            e = json.loads(payload)
+        except Exception:
+            return
+        t = str(e.get("type", ""))
+        if t == "skill_match":
+            self.slbl.setText(f"Skill matched: {e.get('skill_id', '')}")
+        elif t == "skill_miss":
+            hint = str(e.get("hint", "") or "")
+            self.slbl.setText(f"Skill miss: {hint[:80] or e.get('reason', '')}")
+        elif t == "skill_ambiguous":
+            self.slbl.setText("Skill candidates close: using top match")
+        elif t == "skill_status":
+            self.slbl.setText("Skills disabled")
+
+    def _on_skill_draft(self, payload: str):
+        try:
+            draft = json.loads(payload)
+        except Exception:
+            return
+        self._pending_skill_draft = draft
+        self.chat.show_save_skill_prompt(True, "Save Skill")
+        self.slbl.setText("Skill suggestion ready")
+
+    def _open_skill_save_dialog(self):
+        draft = self._pending_skill_draft
+        if not isinstance(draft, dict) or not draft:
+            self.chat.show_save_skill_prompt(False)
+            return
+        dlg = SkillSaveDialog(draft, self)
+        dlg.exec()
+        if dlg.did_save():
+            self.slbl.setText("Skill saved")
+            self._pending_skill_draft = None
+            self.chat.show_save_skill_prompt(False)
 
     def _on_fin(self):
         self._ctx_bind_sid = None
         self.chat.send_btn.setEnabled(True); self._running=False; self._worker=None
+        self._refresh_sessions()
+
+    def _dispose_agent_runtime(self):
+        ag = getattr(self, "_agent", None)
+        if ag is None:
+            return
+        try:
+            backend = getattr(ag, "backend", None)
+            close_fn = getattr(backend, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
+        self._agent = None
 
     def _on_fmod(self, path, content):
         ws=self.config.workspace
@@ -3236,6 +3882,17 @@ class MainWindow(QMainWindow):
     def _save(self):
         if not self._cur_session or not self._agent or not self._agent.messages: return
         self._cur_session.messages=list(self._agent.messages)
+        # Persist model label for assistant bubbles so history can display which model answered.
+        try:
+            bk = self.chat.current_backend_label()
+            md = self.chat.current_model_name()
+            mdl = f"{bk}/{md}" if bk and md else ""
+            for msg in reversed(self._cur_session.messages):
+                if msg.get("role") == "assistant":
+                    msg["model_label"] = mdl
+                    break
+        except Exception:
+            pass
         if self._pending_user_message_meta:
             for msg in reversed(self._cur_session.messages):
                 if msg.get("role") == "user":
@@ -3243,7 +3900,16 @@ class MainWindow(QMainWindow):
                     msg["attachments"] = [dict(a) for a in self._pending_user_message_meta.get("attachments", [])]
                     break
             self._pending_user_message_meta = None
-        self._cur_session.mode=self.config.mode; self._cur_session.workspace=self.config.workspace
+        self._cur_session.mode=self.config.mode
+        self._cur_session.workspace=os.path.abspath(self.config.workspace)
+        # keep per-session backend/model updated (in case user switched before saving)
+        try:
+            bk = self.chat.current_backend_label()
+            md = self.chat.current_model_name()
+            self._cur_session.backend = "kscc" if bk == "Kscc" else "openai"
+            self._cur_session.model = md
+        except Exception:
+            pass
         if not self._cur_session.title or self._cur_session.title in ("New Session","New Chat"):
             self._cur_session.title=self.store.auto_title(self._agent.messages)
         self.store.save(self._cur_session); self._refresh_sessions()
@@ -3288,6 +3954,11 @@ class MainWindow(QMainWindow):
             self._show_main_page()
         else:
             self._show_settings_page()
+
+    def _open_skills_manager(self):
+        dlg = SkillsManagerDialog(self)
+        dlg.exec()
+        self.slbl.setText("Skills updated")
 
 # ── Entry ───────────────────────────────────────────────────
 def main():

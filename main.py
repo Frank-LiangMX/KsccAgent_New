@@ -1,5 +1,5 @@
 """
-Quark Agent - CLI 入口
+Kscc Agent - CLI 入口
 
 使用方式:
   python main.py "帮我创建一个 Python Flask 应用"
@@ -30,7 +30,7 @@ RESET = "\033[0m"
 
 
 async def main_async():
-    parser = argparse.ArgumentParser(description="Quark Agent - AI Coding Assistant")
+    parser = argparse.ArgumentParser(description="Kscc Agent - AI Coding Assistant")
     parser.add_argument("prompt", nargs="*", help="Task description")
     parser.add_argument("--mode", choices=["solo", "ide"], help="Agent mode (default: ide)")
     parser.add_argument("--provider", choices=["openai", "anthropic", "deepseek", "kscc"], help="LLM provider")
@@ -104,7 +104,7 @@ async def main_async():
 
     # 显示运行信息
     print(f"{GRAY}╔{'═' * 58}╗{RESET}")
-    print(f"{GRAY}║{RESET} {BOLD}Quark Agent{RESET}")
+    print(f"{GRAY}║{RESET} {BOLD}Kscc Agent{RESET}")
     print(f"{GRAY}║{RESET} Provider : {CYAN}{provider.name}{RESET}  Model: {CYAN}{provider.model}{RESET}")
     print(f"{GRAY}║{RESET} Mode     : {YELLOW}{mode}{RESET}  Workspace: {GRAY}{cfg.workspace}{RESET}")
     print(f"{GRAY}║{RESET} Max turns: {cfg.max_turns}")
@@ -180,7 +180,7 @@ def _terminal_confirm(tool_call):
 
 def interactive_init():
     """交互式初始化配置。"""
-    print(f"\n{BOLD}Quark Agent - Initial Setup{RESET}\n")
+    print(f"\n{BOLD}Kscc Agent - Initial Setup{RESET}\n")
     cfg = load_config()
 
     providers = list(Config().providers.keys())

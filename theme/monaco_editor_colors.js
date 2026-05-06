@@ -65,7 +65,7 @@ window.QUARK_MONACO_THEME_LIGHT = {
   'editorOverviewRuler.wordHighlightStrongForeground': 'transparent',
 };
 
-window.getQuarkMonacoThemeColors = function(mode){
+window.getKsccMonacoThemeColors = function(mode){
   return String(mode || 'dark').toLowerCase() === 'light'
     ? window.QUARK_MONACO_THEME_LIGHT
     : window.QUARK_MONACO_THEME_DARK;

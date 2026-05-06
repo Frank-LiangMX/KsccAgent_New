@@ -1,4 +1,4 @@
-"""Quark UI theme: palette tokens, Qt stylesheet, icons, chat markdown."""
+"""Kscc UI theme: palette tokens, Qt stylesheet, icons, chat markdown."""
 
 from .icons import quark_icon
 from .markdown import md_chat_to_html

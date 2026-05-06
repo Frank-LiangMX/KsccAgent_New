@@ -1,5 +1,5 @@
 """
-Quark Agent - AI 编码 Agent 核心
+Kscc Agent - AI 编码 Agent 核心
 
 特性:
 - OpenAI / Anthropic 双后端
@@ -11,6 +11,7 @@ Quark Agent - AI 编码 Agent 核心
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import re
 import subprocess
@@ -24,6 +25,8 @@ import httpx
 
 from config import Config, ProviderConfig, load_config, get_active_provider
 from context import ContextTracker, count_messages_tokens, count_tokens, get_max_output
+import memory_store
+from skill_manager import Skill, SkillManager, SkillMatchResult, skill_debug_log
 
 # ══════════════════════════════════════════════════════════════
 #  System Prompt
@@ -34,7 +37,7 @@ _MODE_DESCRIPTIONS = {
     "ide": "You propose changes for user review. When you want to modify a file, explain what you plan to do and call the tool. The user will approve or reject each action. Use read_file and search tools freely without confirmation.",
 }
 
-SYSTEM_PROMPT = """You are Quark, an AI coding assistant that helps users with software engineering tasks.
+SYSTEM_PROMPT = """You are Kscc, an AI coding assistant that helps users with software engineering tasks.
 
 ## Your Capabilities
 - Read, write, and edit files in the workspace
@@ -467,24 +470,7 @@ class ToolExecutor:
         import httpx
         try:
             r = httpx.get(url, timeout=15, follow_redirects=True, headers={
-                "User-Agent": "QuarkAgent/1.0"
-            })
-            r.raise_for_status()
-            ct = r.headers.get("content-type", "")
-            if "text/html" in ct:
-                text = self._html_to_text(r.text)
-            else:
-                text = r.text
-            return text[:10000] + ("..." if len(text) > 10000 else "")
-        except Exception as e:
-            return f"WebFetch Error: {e}"
-
-    def _web_fetch(self, args: dict) -> str:
-        url = args["url"]
-        import httpx
-        try:
-            r = httpx.get(url, timeout=15, follow_redirects=True, headers={
-                "User-Agent": "QuarkAgent/1.0"
+                "User-Agent": "KsccAgent/1.0"
             })
             r.raise_for_status()
             ct = r.headers.get("content-type", "")
@@ -787,6 +773,50 @@ class KsccBackend:
         except json.JSONDecodeError:
             return None
 
+    @staticmethod
+    def _msg_text(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+                else:
+                    parts.append(str(block))
+            return "\n".join([p for p in parts if p])
+        return str(content or "")
+
+    def _build_transcript(self, messages: list[dict], latest_user_text: str) -> str:
+        """
+        kscc CLI stream-json --print currently doesn't accept OpenAI-style message arrays.
+        We inject a compact transcript to preserve local context without relying on process persistence.
+        """
+        transcript = []
+        for m in messages[-18:]:
+            role = m.get("role", "")
+            if role == "system":
+                continue
+            txt = self._msg_text(m.get("content", ""))
+            if not txt.strip():
+                continue
+            if role == "user":
+                transcript.append(f"[User]\n{txt.strip()}")
+            elif role == "assistant":
+                transcript.append(f"[Assistant]\n{txt.strip()}")
+            elif role == "tool":
+                transcript.append(f"[ToolResult]\n{txt.strip()}")
+        if not transcript:
+            return latest_user_text
+        merged = "\n\n".join(transcript)
+        if len(merged) > 18000:
+            merged = merged[-18000:]
+        return (
+            "Conversation transcript:\n"
+            f"{merged}\n\n"
+            "Continue the conversation and answer the latest user message."
+        )
+
     async def chat(self, messages: list[dict], tools: list[dict], max_tokens: int = 16384) -> AsyncGenerator[dict, None]:
         await self._ensure_process()
 
@@ -799,7 +829,8 @@ class KsccBackend:
             yield {"type": "error", "content": "No user message found"}
             return
 
-        await self._send({"type": "user", "message": {"role": "user", "content": user_text}})
+        kscc_input = self._build_transcript(messages, user_text)
+        await self._send({"type": "user", "message": {"role": "user", "content": kscc_input}})
 
         acc_text = ""
         tool_calls = {}
@@ -862,6 +893,23 @@ class KsccBackend:
         except Exception as e:
             yield {"type": "error", "content": f"kscc stream error: {e}"}
 
+    def close(self):
+        """Best-effort shutdown to avoid unclosed proactor transport warnings on Windows."""
+        proc = self._proc
+        self._proc = None
+        if not proc:
+            return
+        try:
+            if proc.stdin and not proc.stdin.is_closing():
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            if proc.returncode is None:
+                proc.terminate()
+        except Exception:
+            pass
+
 
 # ══════════════════════════════════════════════════════════════
 #  Agent
@@ -880,11 +928,17 @@ class Agent:
         self.ctx = ContextTracker(model=provider.model, context_limit=provider.context_limit or self.config.context_limit)
         # 输出上限：用户设置 > 模型默认表 > 16384
         self.max_output = provider.max_output_tokens or self.config.max_output_tokens or get_max_output(provider.model)
-        self._resume_messages = resume_messages  # 预加载的历史消息
-        self.messages: list[dict] = []
+        # 预加载的历史消息（用于从 UI session 恢复）。注意：messages 一旦初始化完成，
+        # 后续多次 run() 应该在同一个 messages 上追加，而不是每次重置。
+        self.messages: list[dict] = list(resume_messages) if resume_messages else []
+        self._resume_messages = None
         self._confirm_result: Optional[bool] = None
         self._confirm_event = None
         self._hooks: dict[str, Callable] = {}
+        self.skill_manager = SkillManager()
+        self._active_skill: Optional[Skill] = None
+        self._skill_match_result: Optional[SkillMatchResult] = None
+        self._run_user_prompt: str = ""
 
     def on(self, event: str, callback: Callable):
         """Register hook: 'confirm' -> callback(tool_call) -> bool"""
@@ -905,16 +959,66 @@ class Agent:
         """
         import asyncio
         self._confirm_event = asyncio.Event()
+        self._run_user_prompt = prompt or ""
+        self._skill_match_result = None
+        dbg = bool(getattr(self.config, "skill_debug_log", False))
+        skills_on = bool(getattr(self.config, "skills_enabled", True))
 
-        # 构建消息：如果有预加载的会话，追加用户消息；否则全新开始
-        if self._resume_messages:
-            self.messages = list(self._resume_messages)
-            self.messages.append({"role": "user", "content": self._build_user_content(prompt, attachments)})
+        if not skills_on:
+            self._active_skill = None
+            self._skill_match_result = None
+            skill_debug_log("skills_enabled=false, skip matching", dbg)
+            yield {"type": "skill_status", "status": "disabled"}
+            effective_prompt = prompt
+        else:
+            mr = self.skill_manager.match_detailed(prompt)
+            self._skill_match_result = mr
+            self._active_skill = mr.best
+            skill_debug_log(
+                f"match prompt={prompt[:200]!r} best={(mr.best.id if mr.best else None)} "
+                f"miss={mr.miss_reason!r} top={[ (round(s,2), sk.id) for s, sk in mr.candidates[:3] ]}",
+                dbg,
+            )
+            if mr.best:
+                yield {
+                    "type": "skill_match",
+                    "skill_id": mr.best.id,
+                    "skill_name": mr.best.name,
+                    "intent_pattern": mr.best.intent_pattern,
+                    "score": mr.candidates[0][0] if mr.candidates else 0,
+                }
+                if mr.is_ambiguous():
+                    alts = [{"id": sk.id, "name": sk.name, "score": round(s, 2)} for s, sk in mr.candidates[1:4]]
+                    yield {"type": "skill_ambiguous", "candidates": alts}
+            else:
+                yield {
+                    "type": "skill_miss",
+                    "reason": mr.miss_reason,
+                    "hint": mr.hint,
+                }
+            effective_prompt = self._augment_prompt_with_skill(prompt, mr)
+
+        # 构建消息：如果已有会话 messages，则直接追加；否则初始化 system + 首条 user。
+        if self.messages:
+            # 防御：历史可能没有 system，补一个
+            if not any(m.get("role") == "system" for m in self.messages):
+                mode_desc = _MODE_DESCRIPTIONS.get(self.mode, _MODE_DESCRIPTIONS["ide"])
+                system = SYSTEM_PROMPT.format(mode_description=mode_desc, workspace=self.config.workspace)
+                if bool(getattr(self.config, "memory_injection_enabled", True)):
+                    mem = memory_store.build_injection_text()
+                    if mem.strip():
+                        system += "\n\n## Local memory (auto)\n" + mem
+                self.messages.insert(0, {"role": "system", "content": system})
+            self.messages.append({"role": "user", "content": self._build_user_content(effective_prompt, attachments)})
         else:
             mode_desc = _MODE_DESCRIPTIONS.get(self.mode, _MODE_DESCRIPTIONS["ide"])
             system = SYSTEM_PROMPT.format(mode_description=mode_desc, workspace=self.config.workspace)
+            if bool(getattr(self.config, "memory_injection_enabled", True)):
+                mem = memory_store.build_injection_text()
+                if mem.strip():
+                    system += "\n\n## Local memory (auto)\n" + mem
             self.messages = [{"role": "system", "content": system}]
-            self.messages.append({"role": "user", "content": self._build_user_content(prompt, attachments)})
+            self.messages.append({"role": "user", "content": self._build_user_content(effective_prompt, attachments)})
 
         # 记录初始 token
         self.ctx.record_prompt(self.messages)
@@ -989,6 +1093,12 @@ class Agent:
                     # 估算最后 token
                     if not self.ctx.output_tokens:
                         self.ctx.record_usage(output_tokens=count_tokens(full_text, self.ctx.model))
+                if self._active_skill:
+                    self.skill_manager.mark_used(self._active_skill.id)
+                if bool(getattr(self.config, "skills_enabled", True)):
+                    draft = self._build_skill_save_draft(full_text)
+                    if draft:
+                        yield {"type": "skill_save_draft", "draft": draft}
                 yield {"type": "done", "text": full_text, "turns": turns, "context": self.ctx.summary()}
                 return
 
@@ -1097,6 +1207,97 @@ class Agent:
         if text_parts:
             content += "\n\n[Attached files]\n" + "\n".join(text_parts)
         return content
+
+    def _augment_prompt_with_skill(self, prompt: str, mr: SkillMatchResult) -> str:
+        skill = mr.best
+        if not skill:
+            return prompt
+        steps = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(skill.steps[:8])) or "1. Follow the best-known sequence."
+        extra = ""
+        if mr.is_ambiguous() and len(mr.candidates) > 1:
+            names = [f"{sk.name} ({sk.id})" for _, sk in mr.candidates[1:4]]
+            if names:
+                extra = "\n[Other close-matching skills — pick the best fit or ignore if irrelevant: " + "; ".join(names) + "]\n"
+        return (
+            f"{prompt}\n\n"
+            "[Matched Local Skill]\n"
+            f"- Skill: {skill.name}\n"
+            f"- ID: {skill.id}\n"
+            "- Guidance: Reuse this plan when it fits the current task. If constraints differ, adapt explicitly.\n"
+            "[Recommended Steps]\n"
+            f"{steps}\n"
+            f"{extra}"
+        )
+
+    def _collect_tool_names_from_messages(self) -> list[str]:
+        seen: list[str] = []
+        for m in self.messages:
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                n = fn.get("name")
+                if n and n not in seen:
+                    seen.append(n)
+        return seen
+
+    def _guess_keywords_from_prompt(self, text: str, max_n: int = 8) -> list[str]:
+        t = (text or "").strip().lower()
+        if not t:
+            return []
+        toks = re.findall(r"[a-zA-Z0-9_./-]+|[\u4e00-\u9fff]{2,}", t)
+        stop = {
+            "the", "and", "for", "with", "this", "that", "from", "into", "your", "you", "are", "was", "has",
+            "please", "just", "only", "dont", "don't",
+            "请", "帮我", "一下", "如何", "什么", "可以", "不要", "使用", "输出", "方案", "计划",
+            "给我", "只给", "不要改", "不要修改", "代码", "文件", "内容", "建议", "一下子", "这个",
+            "一下吧", "看看", "麻烦", "帮忙", "并且", "然后", "以及", "或者", "一个", "一些",
+            "只输出", "分步计划", "重构建议", "不要实际修改文件",
+            "edit_file", "write_file",
+        }
+        noise_patterns = [
+            r"^[0-9]+$",
+            r"^[a-z]$",
+            r"^https?://",
+        ]
+        out = []
+        for w in toks:
+            w = w.strip("`'\".,:;!?()[]{}<>|")
+            if not w:
+                continue
+            if w in stop or len(w) < 2:
+                continue
+            if any(re.match(p, w) for p in noise_patterns):
+                continue
+            if w.endswith(".py") and len(w) > 3:
+                stem = w[:-3]
+                if stem and stem not in out and stem not in stop:
+                    out.append(stem)
+            if w not in out:
+                out.append(w)
+            if len(out) >= max_n:
+                break
+        return out
+
+    def _build_skill_save_draft(self, last_assistant_text: str) -> Optional[dict]:
+        prompt = self._run_user_prompt or ""
+        if not prompt.strip():
+            return None
+        tools_used = self._collect_tool_names_from_messages()
+        title = prompt.replace("\n", " ").strip()[:48] or "Skill"
+        steps: list[str] = []
+        for n in tools_used[:6]:
+            steps.append(f"Use tool `{n}` when appropriate for this task type.")
+        summ = (last_assistant_text or "").strip()
+        if summ:
+            first = summ.split("\n", 1)[0][:240]
+            steps.append(f"Summary hint: {first}")
+        if not steps:
+            steps.append("Follow the assistant's last answer as the workflow baseline.")
+        return {
+            "name": title,
+            "intent_pattern": self._guess_keywords_from_prompt(prompt),
+            "steps": steps[:10],
+            "source_prompt": prompt[:4000],
+        }
 
     def _trim_conversation(self):
         """裁剪消息历史，保留 system + 最近两轮完整对话。"""

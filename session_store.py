@@ -1,5 +1,5 @@
 """
-Quark Agent - 会话持久化存储
+Kscc Agent - 会话持久化存储
 
 存储结构:
   sessions/
@@ -30,9 +30,14 @@ class Session:
         self.title = title or "New Session"
         self.workspace = workspace
         self.mode = mode
+        # Per-session model selection
+        self.backend: str = ""   # "kscc" | "openai" | ...
+        self.model: str = ""     # kscc model name OR openai active name
         self.created = _now_iso()
         self.updated = _now_iso()
         self.messages: list[dict] = []
+        # Runtime switch history, persisted for timeline/audit.
+        self.model_switches: list[dict[str, Any]] = []
         # Kscc 上下文用量快照（随流传输；用于恢复会话时显示环形指示）
         self.context_info: Optional[dict[str, Any]] = None
 
@@ -42,6 +47,8 @@ class Session:
             "title": self.title,
             "workspace": self.workspace,
             "mode": self.mode,
+            "backend": self.backend,
+            "model": self.model,
             "created": self.created,
             "updated": self.updated,
             "message_count": len([m for m in self.messages if m.get("role") in ("assistant", "tool")]),
@@ -53,9 +60,12 @@ class Session:
             "title": self.title,
             "workspace": self.workspace,
             "mode": self.mode,
+            "backend": self.backend,
+            "model": self.model,
             "created": self.created,
             "updated": self.updated,
             "messages": self.messages,
+            "model_switches": self.model_switches,
         }
         if self.context_info is not None:
             d["context_info"] = self.context_info
@@ -71,7 +81,10 @@ class Session:
         )
         s.created = data.get("created", s.created)
         s.updated = data.get("updated", s.updated)
+        s.backend = str(data.get("backend", "") or "")
+        s.model = str(data.get("model", "") or "")
         s.messages = data.get("messages", [])
+        s.model_switches = data.get("model_switches", [])
         s.context_info = data.get("context_info")
         return s
 
