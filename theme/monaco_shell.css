@@ -1,0 +1,133 @@
+/* Quark Monaco embed shell — glass tokens aligned with theme/palette.py */
+:root{
+  --bg-deep:#030712;
+  --bg-mid:#061018;
+  --bg-end:#0c1828;
+  --glass:rgba(255,255,255,0.055);
+  --glass-strong:rgba(255,255,255,0.09);
+  --border:rgba(255,255,255,0.09);
+  --border-glow:rgba(94,233,255,0.22);
+  --text-muted:rgba(255,255,255,0.42);
+  --text-body:rgba(255,255,255,0.62);
+  --text-bright:rgba(255,255,255,0.93);
+  --accent:#5ee9ff;
+  --accent-dim:rgba(94,233,255,0.12);
+  --menu-bg:rgba(10,16,26,.72);
+  --status-bg:rgba(255,255,255,0.04);
+  --shadow-lg:0 24px 64px rgba(0,0,0,.55);
+  --radius-sm:12px;
+  --radius-md:14px;
+  --font-ui:"DM Sans",system-ui,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,Consolas,monospace;
+  --status-h:28px;
+}
+[data-theme="light"]{
+  --bg-deep:#f5f8fc;
+  --bg-mid:#eef3f9;
+  --bg-end:#e6edf6;
+  --glass:rgba(255,255,255,0.90);
+  --glass-strong:rgba(255,255,255,0.96);
+  --border:rgba(2,6,23,0.10);
+  --border-glow:rgba(14,165,233,0.20);
+  --text-muted:rgba(15,23,42,0.50);
+  --text-body:rgba(15,23,42,0.72);
+  --text-bright:rgba(15,23,42,0.92);
+  --accent:#0ea5e9;
+  --accent-dim:rgba(14,165,233,0.14);
+  --menu-bg:rgba(255,255,255,0.94);
+  --status-bg:rgba(255,255,255,0.88);
+  --shadow-lg:0 14px 32px rgba(15,23,42,.16);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{
+  height:100%;overflow:hidden;
+  background:radial-gradient(120% 80% at 15% 10%,rgba(94,233,255,0.06),transparent 52%),
+    radial-gradient(90% 60% at 90% 85%,rgba(99,102,241,0.05),transparent 45%),
+    linear-gradient(165deg,var(--bg-deep) 0%,var(--bg-mid) 48%,var(--bg-end) 100%);
+  color:var(--text-body);
+  font-family:var(--font-ui);
+}
+#container{display:flex;flex-direction:column;height:100%}
+#editor-wrapper{flex:1;position:relative;border:none}
+#editor{width:100%;height:100%}
+#loading{
+  position:absolute;inset:0 0 var(--status-h) 0;display:flex;align-items:center;justify-content:center;flex-direction:column;z-index:10;
+  background:transparent;
+}
+#loading .glass-card{
+  padding:28px 36px;border-radius:var(--radius-md);
+  background:var(--glass);
+  backdrop-filter:saturate(160%) blur(20px);
+  -webkit-backdrop-filter:saturate(160%) blur(20px);
+  border:none;
+  box-shadow:var(--shadow-lg);
+  text-align:center;
+}
+#loading .brand{font-weight:600;font-size:15px;letter-spacing:0.14em;text-transform:uppercase;color:var(--text-bright);margin-bottom:10px}
+#loading .hint{color:var(--text-body);font-size:13px;font-weight:400}
+#loading .status{margin-top:12px;font-size:12px;color:var(--text-muted)}
+#loading .dots{display:inline-flex;gap:7px;margin-top:20px}
+#loading .dots span{width:5px;height:5px;border-radius:50%;background:var(--accent);opacity:.4;animation:dotPulse 1.2s ease-in-out infinite}
+#loading .dots span:nth-child(2){animation-delay:.15s}
+#loading .dots span:nth-child(3){animation-delay:.3s}
+@keyframes dotPulse{0%,80%,100%{opacity:.2;transform:scale(.85)}40%{opacity:1;transform:scale(1)}}
+@media (prefers-reduced-motion:reduce){
+  #loading .dots span{animation:none;opacity:.55}
+}
+#menu{
+  display:none;position:fixed;z-index:20;min-width:220px;
+  background:var(--menu-bg);
+  backdrop-filter:saturate(180%) blur(24px);
+  -webkit-backdrop-filter:saturate(180%) blur(24px);
+  border:none;
+  border-radius:var(--radius-md);
+  padding:6px 0;
+  box-shadow:var(--shadow-lg);
+}
+#menu .item{
+  padding:10px 18px;color:var(--text-bright);font-size:13px;font-weight:500;cursor:pointer;
+  transition:background .15s ease
+}
+#menu .item:hover,#menu .item:focus{background:var(--accent-dim);outline:none}
+#menu .sep{height:1px;background:var(--border);margin:6px 12px;opacity:.8}
+#statusbar{
+  position:relative;height:var(--status-h);
+  background:var(--status-bg);
+  backdrop-filter:saturate(160%) blur(16px);
+  -webkit-backdrop-filter:saturate(160%) blur(16px);
+  color:var(--text-body);font-size:11px;font-weight:500;letter-spacing:0.02em;
+  display:flex;align-items:center;
+  padding:0 16px;gap:22px;flex-shrink:0;
+  border:none;
+  font-variant-numeric:tabular-nums;
+}
+#statusbar span{display:inline-flex;align-items:center;gap:6px}
+#statusbar #st-language{color:var(--accent);font-family:var(--font-mono);font-size:11px;font-weight:500}
+#statusbar #st-cursor,#statusbar #st-selection,#statusbar #st-encoding{font-family:var(--font-mono);font-size:11px;color:var(--text-muted)}
+#statusbar #st-cursor{color:var(--text-body)}
+
+/* Monaco hard override: avoid unexpected red gutter/scrollbar coloring */
+.monaco-editor .margin .line-numbers{
+  color: rgba(148,163,184,0.52) !important;
+}
+.monaco-editor .margin .line-numbers.active-line-number{
+  color: rgba(148,163,184,0.90) !important;
+}
+[data-theme="light"] .monaco-editor .margin .line-numbers{
+  color: rgba(71,85,105,0.56) !important;
+}
+[data-theme="light"] .monaco-editor .margin .line-numbers.active-line-number{
+  color: rgba(15,23,42,0.90) !important;
+}
+.monaco-scrollable-element .scrollbar.vertical .slider{
+  background: rgba(255,255,255,0.12) !important;
+}
+.monaco-scrollable-element .scrollbar.vertical .slider:hover{
+  background: rgba(255,255,255,0.20) !important;
+}
+[data-theme="light"] .monaco-scrollable-element .scrollbar.vertical .slider{
+  background: rgba(100,116,139,0.22) !important;
+}
+[data-theme="light"] .monaco-scrollable-element .scrollbar.vertical .slider:hover{
+  background: rgba(100,116,139,0.34) !important;
+}

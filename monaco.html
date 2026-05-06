@@ -1,0 +1,406 @@
+﻿<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="theme/monaco_shell.css" />
+<script src="theme/monaco_editor_colors.js"></script>
+</head>
+<body>
+<div id="container">
+  <div id="editor-wrapper">
+    <div id="loading">
+      <div class="glass-card">
+        <div class="brand">Kscc UI</div>
+        <div class="hint">Loading editor</div>
+        <div class="status" id="load-status">Preparing resources…</div>
+        <div class="dots" aria-hidden="true"><span></span><span></span><span></span></div>
+      </div>
+    </div>
+    <div id="editor"></div>
+  </div>
+  <div id="menu">
+    <div class="item" data-action="ask-selection">Ask Quark about selection (Ctrl+L)</div>
+    <div class="item" data-action="ask-file">Ask about this file</div>
+    <div class="sep"></div>
+    <div class="item" data-action="copy">Copy selection</div>
+  </div>
+  <div id="statusbar">
+    <span id="st-language">plaintext</span>
+    <span id="st-cursor">Ln 1, Col 1</span>
+    <span id="st-selection">--</span>
+    <span id="st-encoding">UTF-8</span>
+  </div>
+</div>
+
+<script>
+(function(){
+  const MONACO_PATH = 'node_modules/monaco-editor/min/vs';
+  let editor = null;
+  let currentFile = '';
+  const _apiQueue = [];
+  let currentThemeMode = 'dark';
+
+  function drainQueue(){
+    if (!editor) return;
+    var q = _apiQueue.slice(); _apiQueue = [];
+    for (var i = 0; i < q.length; i++) { try { q[i](); } catch(e) {} }
+  }
+
+  // Stub API for Python calls before Monaco ready
+  window._completionsEnabled = true;
+  window._enableCompletions = function(){ window._completionsEnabled = true; };
+  window._disableCompletions = function(){ window._completionsEnabled = false; };
+  window._compCallbacks = {}; var _compId = 0, _pending = null;
+  window._resolveCompletion = function(id, text){
+    if(window._compCallbacks[id]){ window._compCallbacks[id](text||''); delete window._compCallbacks[id]; _pending = null; }
+  };
+  window.setContent = function(text, language){
+    _apiQueue.push(function(){ editor.getModel().setValue(text||''); editor.getModel().setLanguage(language||''); }); drainQueue();
+  };
+  window.setFile = function(path, content){
+    _apiQueue.push(function(){
+      currentFile = path||''; var lang = languageFromPath(currentFile);
+      var model = editor.getModel(); model.setValue(content||''); monaco.editor.setModelLanguage(model, lang);
+      document.getElementById('st-language').textContent = lang; emit('file_opened',{path:currentFile,language:lang});
+    }); drainQueue();
+  };
+  window.getContent = function(){ return editor ? editor.getValue() : ''; };
+
+  const statusEl = document.getElementById('load-status');
+  const loadingEl = document.getElementById('loading');
+  const menuEl = document.getElementById('menu');
+
+  function setStatus(text, isError){
+    statusEl.textContent = text;
+    if(isError) statusEl.style.color = '#ef4444';
+  }
+
+  function emit(type, data){
+    try{ console.log(JSON.stringify({t:type, d:data||{}})); }catch(_e){}
+  }
+
+  function hideLoading(){
+    loadingEl.style.display = 'none';
+  }
+
+  function absUrl(path){
+    return new URL(path, window.location.href).href;
+  }
+
+  self.MonacoEnvironment = {
+    getWorkerUrl: function(moduleId, label){
+      var base = absUrl(MONACO_PATH + '/');
+      var wkPath = absUrl(MONACO_PATH + '/base/worker/workerMain.js');
+      try {
+        var x = new XMLHttpRequest();
+        x.open('GET', wkPath, false);
+        x.send();
+        if (x.status === 200 || x.status === 0) {
+          var code = "self.MonacoEnvironment={baseUrl:'" + base + "'};" + x.responseText;
+          var blob = new Blob([code], {type: 'application/javascript'});
+          return URL.createObjectURL(blob);
+        }
+      } catch(e) {}
+      return wkPath;
+    },
+    globalAPI: false
+  };
+
+  function loadScript(src, onOk, onErr){
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = onOk;
+    s.onerror = onErr;
+    document.head.appendChild(s);
+  }
+
+  function languageFromPath(path){
+    const p = (path || '').toLowerCase();
+    if (p.endsWith('.py')) return 'python';
+    if (p.endsWith('.js')) return 'javascript';
+    if (p.endsWith('.ts')) return 'typescript';
+    if (p.endsWith('.tsx')) return 'typescript';
+    if (p.endsWith('.jsx')) return 'javascript';
+    if (p.endsWith('.json')) return 'json';
+    if (p.endsWith('.md')) return 'markdown';
+    if (p.endsWith('.html')) return 'html';
+    if (p.endsWith('.css')) return 'css';
+    if (p.endsWith('.cpp') || p.endsWith('.cc') || p.endsWith('.cxx') || p.endsWith('.hpp') || p.endsWith('.h')) return 'cpp';
+    if (p.endsWith('.go')) return 'go';
+    if (p.endsWith('.rs')) return 'rust';
+    if (p.endsWith('.java')) return 'java';
+    if (p.endsWith('.cs')) return 'csharp';
+    if (p.endsWith('.rb')) return 'ruby';
+    if (p.endsWith('.php')) return 'php';
+    if (p.endsWith('.swift')) return 'swift';
+    if (p.endsWith('.kt') || p.endsWith('.kts')) return 'kotlin';
+    if (p.endsWith('.scala')) return 'scala';
+    if (p.endsWith('.sql')) return 'sql';
+    if (p.endsWith('.bat') || p.endsWith('.cmd')) return 'bat';
+    if (p.endsWith('.ps1')) return 'powershell';
+    if (p.endsWith('.lua')) return 'lua';
+    if (p.endsWith('.r')) return 'r';
+    if (p.endsWith('.vue')) return 'html';
+    if (p.endsWith('.scss')) return 'scss';
+    if (p.endsWith('.less')) return 'less';
+    if (p.endsWith('.toml')) return 'ini';
+    if (p.endsWith('.ini') || p.endsWith('.cfg')) return 'ini';
+    if (p.endsWith('.yml') || p.endsWith('.yaml')) return 'yaml';
+    if (p.endsWith('.xml')) return 'xml';
+    if (p.endsWith('.sh')) return 'shell';
+    return 'plaintext';
+  }
+
+  function updateStatusbar(){
+    if(!editor) return;
+    const pos = editor.getPosition();
+    const sel = editor.getSelection();
+    const model = editor.getModel();
+    document.getElementById('st-cursor').textContent = `Ln ${pos.lineNumber}, Col ${pos.column}`;
+    if(sel && !sel.isEmpty()){
+      const text = model.getValueInRange(sel);
+      document.getElementById('st-selection').textContent = `${text.length} chars`;
+    }else{
+      document.getElementById('st-selection').textContent = '--';
+    }
+  }
+
+  function setupMenu(){
+    editor.onContextMenu(function(e){
+      if(!e.event.browserEvent.ctrlKey) return;
+      e.event.preventDefault();
+      menuEl.style.display = 'block';
+      menuEl.style.left = `${e.event.browserEvent.clientX}px`;
+      menuEl.style.top = `${e.event.browserEvent.clientY}px`;
+    });
+    document.addEventListener('click', function(){ menuEl.style.display = 'none'; });
+    menuEl.querySelectorAll('.item').forEach(function(el){
+      el.addEventListener('click', function(){
+        const action = el.getAttribute('data-action');
+        const model = editor.getModel();
+        const sel = editor.getSelection();
+        if(action === 'ask-selection'){
+          const text = model.getValueInRange(sel);
+          if(text) emit('ask_selection', {file: currentFile, text});
+        }else if(action === 'ask-file'){
+          emit('ask_file', {file: currentFile});
+        }else if(action === 'copy'){
+          const text = model.getValueInRange(sel);
+          if(text) navigator.clipboard.writeText(text);
+        }
+        menuEl.style.display = 'none';
+      });
+    });
+  }
+
+  function createEditor(monaco){
+    const getColors = (mode) => {
+      if (typeof window.getQuarkMonacoThemeColors === 'function') {
+        return window.getQuarkMonacoThemeColors(mode);
+      }
+      return window.QUARK_MONACO_THEME_DARK || window.QUARK_MONACO_THEME_COLORS || {};
+    };
+
+    monaco.editor.defineTheme('quark-dark', {
+      base: 'vs-dark',
+      inherit: true,
+      rules: [],
+      colors: getColors('dark')
+    });
+    monaco.editor.defineTheme('quark-light', {
+      base: 'vs',
+      inherit: true,
+      rules: [],
+      colors: getColors('light')
+    });
+
+    window.setThemeMode = function(mode){
+      currentThemeMode = (String(mode || 'dark').toLowerCase() === 'light') ? 'light' : 'dark';
+      const themeName = currentThemeMode === 'light' ? 'quark-light' : 'quark-dark';
+      document.documentElement.setAttribute('data-theme', currentThemeMode);
+      try { monaco.editor.setTheme(themeName); } catch(_e) {}
+    };
+
+    editor = monaco.editor.create(document.getElementById('editor'), {
+      value: '',
+      language: 'plaintext',
+      automaticLayout: true,
+      theme: (currentThemeMode === 'light' ? 'quark-light' : 'quark-dark'),
+      minimap: { enabled: false },
+      fontSize: 13,
+      fontFamily: "'JetBrains Mono', ui-monospace, Consolas, monospace",
+      fontLigatures: true,
+      smoothScrolling: true,
+      cursorBlinking: 'smooth',
+      cursorSmoothCaretAnimation: 'on',
+      padding: { top: 8, bottom: 8 },
+      wordWrap: 'on',
+      scrollBeyondLastLine: false,
+      overviewRulerLanes: 0,
+      hideCursorInOverviewRuler: true,
+      renderValidationDecorations: 'off',
+      glyphMargin: false
+    });
+    window.editor = editor;
+    window.setThemeMode(currentThemeMode);
+
+    editor.addAction({
+      id: 'save-requested',
+      label: 'Save Requested',
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
+      run: function(){
+        emit('save_requested', editor.getValue());
+        document.getElementById('st-encoding').textContent = 'UTF-8';
+      }
+    });
+
+    editor.addAction({
+      id: 'ask-selection',
+      label: 'Ask Selection',
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL],
+      run: function(){
+        const sel = editor.getModel().getValueInRange(editor.getSelection());
+        if(sel) emit('ask_selection', {file: currentFile, text: sel});
+      }
+    });
+
+    editor.onDidChangeCursorPosition(updateStatusbar);
+    editor.onDidChangeCursorSelection(updateStatusbar);
+    let timer = null;
+    editor.onDidChangeModelContent(function(){
+      document.getElementById('st-encoding').textContent = 'MOD';
+      if(timer) clearTimeout(timer);
+      timer = setTimeout(function(){ emit('content_changed', editor.getValue()); }, 300);
+    });
+
+    setupMenu();
+    updateStatusbar();
+    hideLoading();
+    emit('ready', {language: 'plaintext'});
+
+    window.setContent = function(text, language){
+      const model = editor.getModel();
+      model.setValue(text || '');
+      monaco.editor.setModelLanguage(model, language || 'plaintext');
+      document.getElementById('st-language').textContent = language || 'plaintext';
+    };
+
+    window.setFile = function(path, content){
+      currentFile = path || '';
+      const lang = languageFromPath(currentFile);
+      const model = editor.getModel();
+      model.setValue(content || '');
+      monaco.editor.setModelLanguage(model, lang);
+      document.getElementById('st-language').textContent = lang;
+      emit('file_opened', {path: currentFile, language: lang});
+    };
+
+    window.getContent = function(){
+      return editor ? editor.getValue() : '';
+    };
+
+    window.getCursorContext = function(){
+      if(!editor) return JSON.stringify({});
+      const pos = editor.getPosition();
+      const model = editor.getModel();
+      return JSON.stringify({
+        file: currentFile,
+        line: pos.lineNumber,
+        column: pos.column,
+        lineText: model.getLineContent(pos.lineNumber)
+      });
+    };
+
+    window.showDiffPreview = function(original, modified, filepath){
+      const lang = languageFromPath(filepath || currentFile || '');
+      const o = monaco.editor.createModel(original || '', lang);
+      const m = monaco.editor.createModel(modified || '', lang);
+      const diff = monaco.editor.createDiffEditor(document.getElementById('editor'), {
+        automaticLayout: true,
+        theme: 'quark-dark',
+        renderSideBySide: true,
+        overviewRulerLanes: 0,
+        renderValidationDecorations: 'off'
+      });
+      diff.setModel({ original: o, modified: m });
+      editor = diff.getModifiedEditor();
+      window.editor = editor;
+      currentFile = filepath || currentFile;
+      document.getElementById('st-language').textContent = lang;
+    };
+
+    window.closeDiff = function(){
+    };
+
+    // ── Tab 补全 ──────────────────────────────────────────
+    function requestCompletion(codeCtx) {
+      if (_pending) { _pending(); _pending = null; }
+      return new Promise(function(resolve) {
+        var id = ++_compId;
+        var done = false;
+        var cancel = function() { if(!done) { done=true; resolve(''); delete window._compCallbacks[id]; } };
+        _pending = cancel;
+        window._compCallbacks[id] = function(t) { if(!done) { done=true; resolve(t||''); delete window._compCallbacks[id]; } };
+        setTimeout(function() { if(window._compCallbacks[id]) { window._compCallbacks[id](''); } }, 6000);
+        emit('completion_request', {id: id, file: currentFile, language: editor.getModel().getLanguageId(), context: codeCtx});
+      });
+    }
+    window._resolveCompletion = function(id, text) {
+      if (window._compCallbacks[id]) { window._compCallbacks[id](text||''); delete window._compCallbacks[id]; _pending = null; }
+    };
+    var compProvider = {
+      provideInlineCompletions: function(m, pos, ctx, token) {
+        if (!window._completionsEnabled) return { items: [] };
+        var before = m.getLineContent(pos.lineNumber).substring(0, pos.column-1);
+        if (before.length < 2) return { items: [] };
+        var line = pos.lineNumber, total = m.getLineCount();
+        var sl = Math.max(1, line - 4), el = Math.min(total, line + 2);
+        var context = m.getValueInRange({startLineNumber: sl, startColumn: 1, endLineNumber: el, endColumn: Number.MAX_SAFE_INTEGER});
+        return new Promise(function(resolve) {
+          setTimeout(function() {
+            requestCompletion(context).then(function(text) {
+              if (token.isCancellationRequested) { resolve({ items: [] }); return; }
+              if (!text || text.trim().length < 2) { resolve({ items: [] }); return; }
+              resolve({ items: [{ insertText: text, range: { startLineNumber: line, startColumn: pos.column, endLineNumber: line, endColumn: pos.column } }] });
+            });
+          }, 300);
+        });
+      },
+      freeInlineCompletions: function() {}
+    };
+    monaco.languages.registerInlineCompletionsProvider({ language: '*' }, compProvider);
+  }
+
+  setStatus('Loading Monaco loader...');
+  loadScript(absUrl(MONACO_PATH + '/loader.js'), function(){
+    if(typeof require === 'undefined'){
+      setStatus('Local loader not available', true);
+      return;
+    }
+    require.config({ paths: { vs: absUrl(MONACO_PATH) } });
+    require(['vs/editor/editor.main'], function(){
+      var m = window.monaco;
+      if (!m) { setStatus('monaco global not found', true); return; }
+      createEditor(m);
+    }, function(err){
+      setStatus('Failed to load editor.main: ' + String(err), true);
+      emit('error', String(err));
+    });
+  }, function(){
+    setStatus('Failed to load local loader.js', true);
+    emit('error', 'loader.js load failed');
+  });
+
+  setTimeout(function(){
+    if(!editor){
+      setStatus('Still loading. Check local node_modules path.', true);
+    }
+  }, 12000);
+})();
+</script>
+</body>
+</html>
