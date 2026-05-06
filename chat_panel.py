@@ -1,0 +1,1013 @@
+"""
+Chat Panel - 聊天面板（包含输入框、消息列表、模型选择）
+从 app.py 提取：ChatPanel
+"""
+
+import os
+import re
+import json
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QFrame, QSizePolicy, QFileDialog, QMenu, QToolTip, QTextEdit,
+)
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, pyqtSignal
+from PyQt6.QtGui import QFont, QFontMetrics, QPixmap
+
+from ui_common import (
+    _is_light_theme, _with_tooltip_style, _make_plus_icon,
+    _ensure_attachments_dir, _attachment_meta, _CODE_FONT_STACK,
+)
+from config import load_config, KSCC_MODELS
+from theme import (
+    quark_icon, C_ACCENT, C_DIM, C_PANEL, C_PANEL_HI,
+    C_TEXT, C_TEAL, C_ACCENT_LIGHT, C_TEAL_LIGHT,
+    C_ACCENT_SEL, C_ACCENT_SEL_LIGHT,
+)
+from chat_widgets import (
+    ChatBubble, ChatInputEdit, ComposerAttachmentChip,
+    ContextRingWidget,
+)
+
+STATUS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+# ── 复杂任务检测 ─────────────────────────────────────────
+_TASK_STEP_MARKERS = [
+    "然后", "接着", "之后", "最后", "并且", "同时",
+    "first", "then", "next", "after that", "finally", "and also",
+]
+_TASK_ACTION_VERBS = [
+    "创建", "生成", "编写", "部署", "配置", "安装", "搭建", "迁移", "重构",
+    "优化", "监控", "自动化", "批量", "定时", "备份", "同步", "集成",
+    "create", "build", "deploy", "configure", "install", "setup", "migrate",
+    "refactor", "optimize", "monitor", "automate", "batch", "backup", "sync",
+]
+
+
+def _is_complex_task(text: str) -> bool:
+    """启发式判断用户输入是否是多步骤复杂任务。"""
+    if not text:
+        return False
+    t = text.lower()
+    # 1. 包含编号列表（"1. xxx 2. xxx" 或 "1、xxx 2、xxx"）
+    if len(re.findall(r'(?:^|\n)\s*(?:\d+[\.\)、])', t)) >= 2:
+        return True
+    # 2. 包含多个步骤标记词
+    step_hits = sum(1 for m in _TASK_STEP_MARKERS if m in t)
+    if step_hits >= 2:
+        return True
+    # 3. 长文本 + 至少一个动作动词
+    verb_hits = sum(1 for v in _TASK_ACTION_VERBS if v in t)
+    if len(t) > 80 and verb_hits >= 2:
+        return True
+    # 4. 包含多个动作动词（>=3）
+    if verb_hits >= 3:
+        return True
+    # 5. 含"并且...还"或"不仅要...还要"等并列结构
+    if ("并且" in t and "还" in t) or ("不仅" in t and "还要" in t):
+        return True
+    if ("not only" in t and "but also" in t) or ("and also" in t):
+        return True
+    return False
+
+
+class TaskSuggestionBar(QFrame):
+    """悬浮在输入框上方的任务模式建议条。"""
+    enable_task_mode = pyqtSignal()   # 用户点击"开启 Task 模式"
+    send_anyway = pyqtSignal()        # 用户点击"直接发送"
+    dismissed = pyqtSignal()          # 用户关闭
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("taskSuggestionBar")
+        self.setFixedHeight(44)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 0, 14, 0)
+        layout.setSpacing(10)
+
+        icon_lbl = QLabel("⚡")
+        icon_lbl.setFixedWidth(20)
+        layout.addWidget(icon_lbl)
+
+        msg_lbl = QLabel("检测到复杂任务，建议开启 Task 模式以获得更可靠的分步执行")
+        msg_lbl.setWordWrap(True)
+        layout.addWidget(msg_lbl, 1)
+
+        self._enable_btn = QPushButton("开启 Task 模式")
+        self._enable_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._enable_btn.setFixedHeight(28)
+        self._enable_btn.clicked.connect(self.enable_task_mode.emit)
+        layout.addWidget(self._enable_btn)
+
+        self._send_btn = QPushButton("直接发送")
+        self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send_btn.setFixedHeight(28)
+        self._send_btn.clicked.connect(self.send_anyway.emit)
+        layout.addWidget(self._send_btn)
+
+        dismiss_btn = QPushButton("✕")
+        dismiss_btn.setFixedSize(24, 24)
+        dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        dismiss_btn.clicked.connect(self.dismissed.emit)
+        layout.addWidget(dismiss_btn)
+
+        self.hide()
+
+    def apply_theme(self, light: bool):
+        bg = "rgba(255,200,50,0.12)" if light else "rgba(255,200,50,0.08)"
+        border = "1px solid rgba(255,200,50,0.3)" if light else "1px solid rgba(255,200,50,0.15)"
+        text = "#1a1a1a" if light else "#e0e0e0"
+        accent = "#d4a017" if light else "#f0c040"
+        self.setStyleSheet(
+            f"#taskSuggestionBar {{background:{bg};border:{border};border-radius:10px;}}"
+            f"QLabel{{color:{text};font-size:12px;background:transparent;}}"
+            f"QPushButton{{background:transparent;border:1px solid {accent};color:{accent};"
+            f"border-radius:6px;padding:2px 10px;font-size:11px;}}"
+            f"QPushButton:hover{{background:rgba(255,200,50,0.15);}}"
+        )
+
+
+class ChatPanel(QWidget):
+    send_message = pyqtSignal(str, object)
+    add_skill_requested = pyqtSignal()
+    task_suggestion_accepted = pyqtSignal(str, object)  # (text, attachments)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(260)
+        self._pending_attachments: list[dict] = []
+        self._diff_cards: dict[str, dict] = {}
+        self._empty_mode = False
+        self._bulk_restore = False
+        self._task_mode_enabled = False
+        l = QVBoxLayout(self)
+        self._root_layout = l
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(0)
+        self._empty_top_spacer = QWidget()
+        self._empty_top_spacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self._empty_top_spacer.hide()
+        l.addWidget(self._empty_top_spacer, 1)
+
+        self._empty_intro = QWidget()
+        ei = QVBoxLayout(self._empty_intro)
+        ei.setContentsMargins(24, 0, 24, 10)
+        ei.setSpacing(6)
+        self._empty_workspace_lbl = QLabel("")
+        self._empty_workspace_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._empty_title_lbl = QLabel("Start a new session")
+        self._empty_title_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._empty_subtitle_lbl = QLabel("Plan, build, and iterate from here.")
+        self._empty_subtitle_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._empty_subtitle_lbl.setWordWrap(True)
+        ei.addWidget(self._empty_workspace_lbl)
+        ei.addWidget(self._empty_title_lbl)
+        ei.addWidget(self._empty_subtitle_lbl)
+        self._empty_intro.hide()
+        l.addWidget(self._empty_intro, 0)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.msg_container = QWidget()
+        self.msg_container.setStyleSheet("background: transparent;")
+        self.msg_layout = QVBoxLayout(self.msg_container)
+        self.msg_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.msg_layout.setSpacing(10)
+        self.msg_layout.setContentsMargins(12, 14, 12, 14)
+        self.msg_layout.addStretch()
+        self.scroll.setWidget(self.msg_container)
+        l.addWidget(self.scroll, 1)
+
+        # Status line
+        self._status_base_text = ""
+        self._status_phase = 0
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(420)
+        self._status_timer.timeout.connect(self._tick_status)
+        self.kscc_status_lbl = QLabel("")
+        self.kscc_status_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.kscc_status_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.kscc_status_lbl.setContentsMargins(0, 0, 0, 0)
+        self.kscc_status_lbl.hide()
+        l.addWidget(self.kscc_status_lbl)
+
+        # Composer
+        self._model_map: dict[str, list[str]] = {}
+        self._backend_key = "Kscc"
+        self._model_name = ""
+
+        self.mode_menu_btn = QPushButton("")
+        self.mode_menu_btn.setFixedHeight(28)
+        self.mode_menu_btn.setMinimumWidth(156)
+        self.mode_menu_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mode_menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mode_menu_btn.clicked.connect(self._show_runtime_menu)
+
+        self._input_card = QFrame()
+        self._input_card.setObjectName("inputGlassCard")
+        vl = QVBoxLayout(self._input_card)
+        vl.setContentsMargins(10, 8, 10, 8)
+        vl.setSpacing(4)
+
+        self.input_edit = ChatInputEdit()
+        self.input_edit.setObjectName("composerInput")
+        self.input_edit.setPlaceholderText("输入消息…  Ctrl+Enter 发送")
+        _ife = QFont("Segoe UI", 10)
+        self.input_edit.setFont(_ife)
+        _fm = QFontMetrics(_ife)
+        self._input_min_h = max(28, _fm.lineSpacing() + 8)
+        self._input_max_h = 220
+        self.input_edit.send_requested.connect(self._send)
+        self.input_edit.image_pasted.connect(self._on_image_pasted)
+        self.input_edit.files_dropped.connect(self._on_files_dropped)
+        self.input_edit.drag_state_changed.connect(self._set_drag_active)
+        self.input_edit.document().contentsChanged.connect(self._adjust_input_height)
+        self.input_edit.height_refresh_requested.connect(self._adjust_input_height)
+
+        self.attachments_row = QWidget()
+        self.attachments_layout = QHBoxLayout(self.attachments_row)
+        self.attachments_layout.setContentsMargins(4, 0, 4, 2)
+        self.attachments_layout.setSpacing(6)
+        self.attachments_layout.addStretch(1)
+        self.attachments_row.hide()
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+        toolbar.setContentsMargins(0, 0, 0, 0)
+
+        self._plus_btn = QPushButton("")
+        self._plus_btn.setFixedSize(28, 28)
+        self._plus_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._plus_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._plus_btn.setIconSize(QSize(14, 14))
+        self._plus_btn.setToolTip("添加附件")
+        self._plus_btn.clicked.connect(self._pick_attachments)
+
+        self.send_btn = QPushButton("↑")
+        self.send_btn.setFixedSize(28, 28)
+        self.send_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.send_btn.setToolTip("发送")
+        self.send_btn.clicked.connect(self._send)
+
+        self.stop_btn = QPushButton("■")
+        self.stop_btn.setFixedSize(28, 28)
+        self.stop_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_btn.setStyleSheet(
+            _with_tooltip_style(
+                "QPushButton {"
+                "  background:#f8654b; color:#ffffff; border:none;"
+                "  border-radius:14px; font-size:12px;"
+                "  padding:0px; font-family:'Segoe UI Symbol','Microsoft YaHei';"
+                "}"
+                "QPushButton:hover { background:#ff7a63; }"
+                "QPushButton:pressed { background:#e65740; }"
+            )
+        )
+        self.stop_btn.setToolTip("停止")
+        self.stop_btn.hide()
+
+        toolbar.addWidget(self._plus_btn)
+        toolbar.addStretch(1)
+        toolbar.addWidget(self.mode_menu_btn)
+        toolbar.addWidget(self.send_btn)
+        toolbar.addWidget(self.stop_btn)
+
+        self._refresh_mode_menu_btn_text()
+
+        vl.addWidget(self.attachments_row)
+        vl.addWidget(self.input_edit)
+        vl.addLayout(toolbar)
+
+        self.input_wrap = QWidget()
+        self.input_wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        iw = QVBoxLayout(self.input_wrap)
+        iw.setContentsMargins(12, 6, 12, 12)
+        iw.setSpacing(4)
+        self.save_skill_btn = QPushButton("Save Skill")
+        self.save_skill_btn.setObjectName("saveSkillBtn")
+        self.save_skill_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.save_skill_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.save_skill_btn.clicked.connect(self.add_skill_requested.emit)
+        self.save_skill_btn.hide()
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.addStretch(1)
+        top_bar.addWidget(self.save_skill_btn, 0, Qt.AlignmentFlag.AlignRight)
+        iw.addLayout(top_bar)
+        iw.addWidget(self._input_card)
+        self._composer_host = QWidget()
+        self._composer_layout = QHBoxLayout(self._composer_host)
+        self._composer_layout.setContentsMargins(0, 0, 0, 0)
+        self._composer_layout.setSpacing(0)
+        self._composer_left_spacer = QWidget()
+        self._composer_left_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._composer_right_spacer = QWidget()
+        self._composer_right_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._composer_layout.addWidget(self._composer_left_spacer, 1)
+        self._composer_layout.addWidget(self.input_wrap, 0)
+        self._composer_layout.addWidget(self._composer_right_spacer, 1)
+        self._task_suggestion = TaskSuggestionBar()
+        self._task_suggestion.enable_task_mode.connect(self._on_task_suggestion_enable)
+        self._task_suggestion.send_anyway.connect(self._on_task_suggestion_send_anyway)
+        self._task_suggestion.dismissed.connect(self._on_task_suggestion_dismiss)
+        self._pending_task_text: str = ""
+        self._pending_task_attachments: list = []
+        l.addWidget(self._task_suggestion)
+        l.addWidget(self._composer_host)
+
+        self._empty_bottom_spacer = QWidget()
+        self._empty_bottom_spacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self._empty_bottom_spacer.hide()
+        l.addWidget(self._empty_bottom_spacer, 1)
+        self._stream_bubble: Optional[ChatBubble] = None
+        self._drag_active = False
+        self.apply_theme()
+        self.set_empty_state(True)
+        QTimer.singleShot(0, self._adjust_input_height)
+
+    def apply_theme(self):
+        light = _is_light_theme()
+        if light:
+            card_bg = "rgba(255,255,255,0.96)"
+            card_border = "1px solid rgba(0,0,0,0.10)"
+            card_drag_bg = "#edf6ff"
+            card_drag_border = "2px solid rgba(59,130,246,0.55)"
+            menu_fg = "#000000"
+            menu_fg_h = "#000000"
+            menu_bg_h = "rgba(0,0,0,0.06)"
+            input_fg = "#000000"
+            plus_bg = "rgba(0,0,0,0.06)"
+            plus_bg_h = "rgba(0,0,0,0.10)"
+            plus_fg = "#333333"
+            plus_fg_h = "#000000"
+            plus_icon = "#333333"
+            send_bg = "#d1d5db"
+            send_fg = "#000000"
+            send_hover = "#e5e7eb"
+            send_dis_bg = "#9ca3af"
+            send_dis_fg = "#1f2937"
+        else:
+            card_bg = "rgba(32,36,44,0.94)"
+            card_border = "none"
+            card_drag_bg = "rgba(37,99,235,0.18)"
+            card_drag_border = "1px solid rgba(94,233,255,0.45)"
+            menu_fg = "#b6bac2"
+            menu_fg_h = "#ffffff"
+            menu_bg_h = "#313131"
+            input_fg = C_TEXT
+            plus_bg = "#2d2d2d"
+            plus_bg_h = "#3d3d3d"
+            plus_fg = "#a9adb5"
+            plus_fg_h = "#ffffff"
+            plus_icon = "#d4d7dd"
+            send_bg = "#d7d9df"
+            send_fg = "#1d1f24"
+            send_hover = "#ffffff"
+            send_dis_bg = "#8a8f99"
+            send_dis_fg = "#262a31"
+        self._input_card.setStyleSheet(
+            f"QFrame#inputGlassCard{{background:{card_drag_bg if self._drag_active else card_bg};"
+            f"border:{card_drag_border if self._drag_active else card_border};border-radius:22px}}"
+        )
+        self.input_edit.setStyleSheet(
+            f"QTextEdit#composerInput{{background:transparent;border:none;color:{input_fg};padding:0px 4px}}"
+            f"QTextEdit#composerInput:focus{{border:none}}"
+        )
+        self.mode_menu_btn.setStyleSheet(
+            _with_tooltip_style(
+                "QPushButton {"
+                f"  background:transparent; color:{menu_fg}; border:none;"
+                "  border-radius:8px; padding:2px 8px; font-size:12px;"
+                "  text-align:center;"
+                f"  font-family:{_CODE_FONT_STACK};"
+                "}"
+                f"QPushButton:hover {{ background:{menu_bg_h}; color:{menu_fg_h}; }}"
+            )
+        )
+        self._plus_btn.setIcon(_make_plus_icon(size=14, color=plus_icon))
+        self._plus_btn.setStyleSheet(
+            _with_tooltip_style(
+                "QPushButton {"
+                f"  background:{plus_bg}; color:{plus_fg}; border:none;"
+                "  border-radius:14px;"
+                "  padding:0px;"
+                "  text-align:center;"
+                "}"
+                f"QPushButton:hover {{ background:{plus_bg_h}; color:{plus_fg_h}; }}"
+            )
+        )
+        self.send_btn.setStyleSheet(
+            _with_tooltip_style(
+                "QPushButton {"
+                f"  background:{send_bg}; color:{send_fg}; border:none;"
+                "  border-radius:14px; font-size:13px; font-weight:bold;"
+                "  padding:0px; font-family:'Segoe UI Symbol','Microsoft YaHei';"
+                "}"
+                f"QPushButton:hover {{ background:{send_hover}; }}"
+                f"QPushButton:disabled {{ background:{send_dis_bg}; color:{send_dis_fg}; }}"
+            )
+        )
+        if light:
+            chip_bg = "#ffefe5"
+            chip_fg = "#9a3412"
+            chip_hover = "#ffe1d2"
+        else:
+            chip_bg = "rgba(245,101,75,0.22)"
+            chip_fg = "#ffd4cc"
+            chip_hover = "rgba(245,101,75,0.30)"
+        self.save_skill_btn.setStyleSheet(
+            _with_tooltip_style(
+                "QPushButton{"
+                f"background:{chip_bg};color:{chip_fg};border:none;border-radius:10px;"
+                "padding:4px 10px;font-size:11px;font-weight:700;"
+                "}"
+                f"QPushButton:hover{{background:{chip_hover};}}"
+            )
+        )
+        if light:
+            ws_col = "#64748b"
+            title_col = "#0f172a"
+            sub_col = "#475569"
+        else:
+            ws_col = "#8b95a5"
+            title_col = "#eef4f8"
+            sub_col = "#9aa4b2"
+        self._empty_workspace_lbl.setStyleSheet(
+            f"color:{ws_col};background:transparent;font-size:12px;font-weight:600;letter-spacing:0.03em;"
+        )
+        self._empty_title_lbl.setStyleSheet(
+            f"color:{title_col};background:transparent;font-size:28px;font-weight:800;"
+        )
+        self._empty_subtitle_lbl.setStyleSheet(
+            f"color:{sub_col};background:transparent;font-size:13px;font-weight:500;"
+        )
+        self._task_suggestion.apply_theme(light)
+        for i in range(self.attachments_layout.count()):
+            item = self.attachments_layout.itemAt(i)
+            w = item.widget()
+            if isinstance(w, ComposerAttachmentChip):
+                w.apply_theme()
+
+    def clear_messages(self):
+        while self.msg_layout.count():
+            item = self.msg_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.msg_layout.addStretch()
+        self._stream_bubble = None
+        self._diff_cards.clear()
+
+    def begin_bulk_restore(self):
+        self._bulk_restore = True
+        self._stream_bubble = None
+        self.scroll.hide()
+        self.msg_container.setUpdatesEnabled(False)
+        self.scroll.setUpdatesEnabled(False)
+        self.setUpdatesEnabled(False)
+
+    def end_bulk_restore(self):
+        self._bulk_restore = False
+        self.setUpdatesEnabled(True)
+        self.scroll.setUpdatesEnabled(True)
+        self.msg_container.setUpdatesEnabled(True)
+        if not self._empty_mode:
+            self.scroll.show()
+        self.msg_container.adjustSize()
+        QTimer.singleShot(0, self._adjust_input_height)
+        QTimer.singleShot(0, self._scroll)
+
+    def set_empty_context(self, workspace: str = "", title: str = "Start a new session", subtitle: str = ""):
+        self._empty_workspace_lbl.setText("KsccUI")
+        self._empty_title_lbl.setText(str(title or "Start a new session"))
+        self._empty_subtitle_lbl.setText(str(subtitle or "Plan, build, and iterate from here."))
+
+    def set_empty_state(self, active: bool, workspace: str = "", title: str = "", subtitle: str = ""):
+        self._empty_mode = bool(active)
+        if workspace or title or subtitle:
+            self.set_empty_context(workspace, title or "Start a new session", subtitle)
+        self.scroll.setVisible((not self._empty_mode) and (not self._bulk_restore))
+        self.kscc_status_lbl.setVisible((not self._empty_mode) and bool(self._status_base_text))
+        self._empty_top_spacer.setVisible(self._empty_mode)
+        self._empty_intro.setVisible(self._empty_mode)
+        self._empty_bottom_spacer.setVisible(self._empty_mode)
+        self.input_wrap.setMinimumWidth(1080 if self._empty_mode else 0)
+        self.input_wrap.setMaximumWidth(1080 if self._empty_mode else 16777215)
+        self.input_wrap.setSizePolicy(
+            QSizePolicy.Policy.Preferred if self._empty_mode else QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        self._composer_left_spacer.setVisible(self._empty_mode)
+        self._composer_right_spacer.setVisible(self._empty_mode)
+        self._composer_layout.setStretch(0, 1 if self._empty_mode else 0)
+        self._composer_layout.setStretch(1, 0 if self._empty_mode else 1)
+        self._composer_layout.setStretch(2, 1 if self._empty_mode else 0)
+        if self._empty_mode:
+            self.input_edit.setPlaceholderText("Plan, build, ask, or drop files here")
+        else:
+            self.input_edit.setPlaceholderText("输入消息…  Ctrl+Enter 发送")
+        QTimer.singleShot(0, self._adjust_input_height)
+
+    def _set_drag_active(self, active: bool):
+        active = bool(active)
+        if self._drag_active == active:
+            return
+        self._drag_active = active
+        self.apply_theme()
+
+    def _adjust_input_height(self):
+        QTimer.singleShot(0, self._sync_composer_height)
+
+    def _sync_composer_height(self):
+        te = self.input_edit
+        vp_w = te.viewport().width()
+        if vp_w <= 0:
+            QTimer.singleShot(10, self._sync_composer_height)
+            return
+
+        doc = te.document()
+        doc.setTextWidth(vp_w)
+        plain = te.toPlainText()
+        if not plain.strip():
+            h = self._input_min_h
+        else:
+            doc_h = int(doc.size().height())
+            if doc_h <= 0:
+                doc_h = QFontMetrics(te.font()).lineSpacing() * max(1, plain.count("\n") + 1)
+            m = te.contentsMargins().top() + te.contentsMargins().bottom()
+            fw = int(te.frameWidth() or 0) * 2
+            h = max(self._input_min_h, min(self._input_max_h, doc_h + m + fw + 8))
+
+        te.setFixedHeight(h)
+        te.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            if h >= self._input_max_h
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+    def _models_for_backend(self, backend: str) -> list[str]:
+        raw = list(self._model_map.get(backend) or [])
+        if backend == "Kscc" and not raw:
+            raw = list(KSCC_MODELS)
+        return raw
+
+    def _refresh_mode_menu_btn_text(self):
+        model = self._model_name or "—"
+        model_display = model.split("/", 1)[1].strip() if "/" in model else model
+        abbrev = "OA" if self._backend_key == "OpenAI" else "KS"
+        short = model_display if len(model_display) <= 28 else model_display[:25] + "…"
+        self.mode_menu_btn.setText(f"[{abbrev}] {short}  ▾")
+        self.mode_menu_btn.setToolTip(f"后端: {self._backend_key}\n模型: {model}")
+
+    def _pick_backend(self, backend: str):
+        if self._backend_key == backend:
+            return
+        self._backend_key = backend
+        models = self._models_for_backend(backend)
+        self._model_name = models[0] if models else ""
+        self._refresh_mode_menu_btn_text()
+
+    def _pick_model(self, model: str):
+        self._model_name = model
+        self._refresh_mode_menu_btn_text()
+
+    def _show_runtime_menu(self):
+        menu = QMenu(self)
+        light = _is_light_theme()
+        if light:
+            m_bg = "rgba(255,255,255,0.98)"
+            m_fg = "#0f172a"
+            m_sel = "rgba(12,74,110,0.12)"
+            m_sep = "rgba(15,23,42,0.10)"
+            m_disabled = "#64748b"
+        else:
+            m_bg = "#252526"
+            m_fg = "#ffffff"
+            m_sel = "#3a3a3d"
+            m_sep = "#3a3d41"
+            m_disabled = "#8f959f"
+        menu.setStyleSheet(
+            "QMenu {"
+            f"  background:{m_bg}; color:{m_fg}; border:none;"
+            "  border-radius:10px; padding:8px 6px;"
+            f"  font-family:{_CODE_FONT_STACK}; font-size:12px;"
+            "}"
+            f"QMenu::item {{ padding:7px 12px; border-radius:6px; margin:1px 4px; color:{m_fg}; }}"
+            f"QMenu::item:selected {{ background:{m_sel}; color:{m_fg}; }}"
+            f"QMenu::item:disabled {{ color:{m_disabled}; background:transparent; }}"
+            f"QMenu::separator {{ height:1px; background:{m_sep}; margin:6px 8px; }}"
+        )
+        header_font = QFont(self.font())
+        header_font.setPointSize(10)
+        header_font.setBold(True)
+
+        backend_title = menu.addAction("后端")
+        backend_title.setFont(header_font)
+        backend_title.setEnabled(False)
+        for bk, label in [("Kscc", "Kscc (Claude Code)"), ("OpenAI", "OpenAI")]:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(bk == self._backend_key)
+            act.triggered.connect(lambda checked=False, b=bk: self._pick_backend(b))
+
+        menu.addSeparator()
+
+        model_title = menu.addAction("模型")
+        model_title.setFont(header_font)
+        model_title.setEnabled(False)
+        models = self._models_for_backend(self._backend_key)
+        if not models:
+            models = ["Add in Settings..."]
+        cur = self._model_name
+        for m in models:
+            act = menu.addAction(m)
+            act.setCheckable(True)
+            act.setChecked(m == cur)
+            act.triggered.connect(lambda checked=False, mm=m: self._pick_model(mm))
+
+        pos = self.mode_menu_btn.mapToGlobal(QPoint(0, self.mode_menu_btn.height() + 4))
+        menu.exec(pos)
+
+    def set_models(self, backend: str, models: list[str], active: str = ""):
+        self._model_map[backend] = list(models)
+        if active and self._backend_key == backend:
+            self._model_name = active
+        self._refresh_mode_menu_btn_text()
+
+    def set_active(self, backend: str, model: str):
+        self._backend_key = backend
+        self._model_name = model
+        self._refresh_mode_menu_btn_text()
+
+    def current_backend_label(self) -> str:
+        return self._backend_key
+
+    def current_model_name(self) -> str:
+        return self._model_name
+
+    def set_kscc_status(self, text: str):
+        self._status_base_text = str(text or "").strip()
+        self._status_phase = 0
+        if not self._status_base_text:
+            self.kscc_status_lbl.hide()
+            self._status_timer.stop()
+            return
+        if not self._status_timer.isActive():
+            self._status_timer.start()
+        self._apply_status_style()
+        self._render_status()
+        self.kscc_status_lbl.show()
+
+    def _apply_status_style(self):
+        light = _is_light_theme()
+        accent_hex = str(getattr(load_config(), "accent_color", "#5ee9ff") or "#5ee9ff").strip()
+        if not accent_hex.startswith("#"):
+            accent_hex = "#5ee9ff"
+        fg = accent_hex
+        pad_l = 22
+        pad_r = 10
+        pad_t = 2
+        pad_b = 4
+        self.kscc_status_lbl.setStyleSheet(
+            f"QLabel{{color:{fg};font-size:10px;padding:{pad_t}px {pad_r}px {pad_b}px {pad_l}px;background:transparent;}}"
+        )
+
+    def _render_status(self):
+        frame = STATUS_FRAMES[self._status_phase % len(STATUS_FRAMES)] if STATUS_FRAMES else ""
+        prefix = f"{frame} " if frame else ""
+        self.kscc_status_lbl.setText(prefix + self._status_base_text)
+
+    def _tick_status(self):
+        if not self._status_base_text:
+            self._status_timer.stop()
+            return
+        self._status_phase += 1
+        self._render_status()
+
+    def _pick_attachments(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "选择附件", "", "All Files (*.*)")
+        for path in files:
+            self._append_attachment(_attachment_meta(path, "file"))
+
+    def _append_attachment(self, meta: dict):
+        path = meta.get("path", "")
+        if not path:
+            return
+        for existing in self._pending_attachments:
+            if existing.get("path") == path:
+                return
+        self._pending_attachments.append(dict(meta))
+        self._refresh_attachments_row()
+
+    def _remove_attachment(self, path: str):
+        self._pending_attachments = [m for m in self._pending_attachments if m.get("path") != path]
+        self._refresh_attachments_row()
+
+    def _save_pasted_image(self, pixmap: QPixmap) -> Optional[dict]:
+        if pixmap.isNull():
+            return None
+        folder = _ensure_attachments_dir()
+        name = f"pasted-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}.png"
+        target = folder / name
+        if not pixmap.save(str(target), "PNG"):
+            return None
+        return _attachment_meta(str(target), "clipboard")
+
+    def _on_image_pasted(self, pixmap):
+        if not isinstance(pixmap, QPixmap):
+            return
+        meta = self._save_pasted_image(pixmap)
+        if meta:
+            self._append_attachment(meta)
+
+    def _on_files_dropped(self, paths):
+        for path in list(paths or []):
+            if not path:
+                continue
+            ap = os.path.abspath(path)
+            if os.path.isfile(ap):
+                self._append_attachment(_attachment_meta(ap, "drop"))
+
+    def _refresh_attachments_row(self):
+        while self.attachments_layout.count():
+            item = self.attachments_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if not self._pending_attachments:
+            self.attachments_row.hide()
+            return
+        for meta in self._pending_attachments:
+            chip = ComposerAttachmentChip(meta)
+            chip.removed.connect(self._remove_attachment)
+            self.attachments_layout.addWidget(chip, 0, Qt.AlignmentFlag.AlignLeft)
+        self.attachments_layout.addStretch(1)
+        self.attachments_row.show()
+
+    def _send(self):
+        t = self.input_edit.toPlainText().strip()
+        attachments = [dict(meta) for meta in self._pending_attachments]
+        if t or attachments:
+            # 如果 Task 模式未开启且检测到复杂任务，弹出建议
+            if not self._task_mode_enabled and _is_complex_task(t):
+                self._pending_task_text = t
+                self._pending_task_attachments = attachments
+                self._task_suggestion.show()
+                return
+            self._do_send(t, attachments)
+        self._adjust_input_height()
+
+    def _do_send(self, t: str, attachments: list):
+        self.set_empty_state(False)
+        self.add_message("user", t, attachments=attachments)
+        self.send_message.emit(t, attachments)
+        self.show_save_skill_prompt(False)
+        self.input_edit.clear()
+        self._pending_attachments.clear()
+        self._refresh_attachments_row()
+        self._adjust_input_height()
+
+    def _on_task_suggestion_enable(self):
+        """用户点击"开启 Task 模式"。"""
+        self._task_suggestion.hide()
+        self.task_suggestion_accepted.emit(self._pending_task_text, self._pending_task_attachments)
+        self._pending_task_text = ""
+        self._pending_task_attachments = []
+
+    def _on_task_suggestion_send_anyway(self):
+        """用户点击"直接发送"。"""
+        self._task_suggestion.hide()
+        t = self._pending_task_text
+        attachments = self._pending_task_attachments
+        self._pending_task_text = ""
+        self._pending_task_attachments = []
+        if t or attachments:
+            self._do_send(t, attachments)
+
+    def _on_task_suggestion_dismiss(self):
+        """用户关闭建议条。"""
+        self._task_suggestion.hide()
+        self._pending_task_text = ""
+        self._pending_task_attachments = []
+
+    def show_save_skill_prompt(self, visible: bool, text: str = "Save Skill"):
+        self.save_skill_btn.setText(str(text or "Save Skill"))
+        self.save_skill_btn.setVisible(bool(visible))
+
+    def clear_diff_cards(self):
+        self._diff_cards.clear()
+
+    def add_message(self, role, text, attachments: Optional[list[dict]] = None, model_label: str = "", render_markdown: bool = True):
+        self.set_empty_state(False)
+        b = ChatBubble(
+            role,
+            text,
+            scroll_area=self.scroll,
+            attachments=attachments,
+            model_label=model_label,
+            render_markdown=render_markdown,
+        )
+        self.msg_layout.insertWidget(max(0, self.msg_layout.count() - 1), b)
+        if not self._bulk_restore:
+            QTimer.singleShot(30, self._scroll)
+        return b
+
+    def start_stream(self, model_label: str = ""):
+        self._stream_bubble = self.add_message("assistant", "", model_label=model_label)
+        self.send_btn.setEnabled(False)
+        self.send_btn.hide()
+        self.stop_btn.show()
+
+    def append_stream(self, text: str):
+        if not text or not self._stream_bubble:
+            return
+        try:
+            self._stream_bubble.append_text(text)
+        except RuntimeError:
+            self._stream_bubble = None
+            return
+        if not self._bulk_restore:
+            QTimer.singleShot(40, self._scroll)
+
+    def end_stream(self):
+        self._stream_bubble = None
+        self.send_btn.setEnabled(True)
+        self.send_btn.show()
+        self.stop_btn.hide()
+
+    def add_tool(self, name, preview):
+        if self._stream_bubble and name not in ("edit_file", "Write", "Edit"):
+            try:
+                self._stream_bubble.append_text(f"\n· Tool · {preview}\n")
+            except RuntimeError:
+                self._stream_bubble = None
+
+    def add_result(self, result, error=False):
+        if self._stream_bubble:
+            marker = "Failed ·" if error else "Done ·"
+            try:
+                self._stream_bubble.append_text(f"{marker} {result[:400]}\n")
+            except RuntimeError:
+                self._stream_bubble = None
+
+    def add_memory_hits(self, text: str):
+        """P3-5: Display memory hit summary as a subtle info line."""
+        if self._stream_bubble:
+            try:
+                self._stream_bubble.append_text(f"\n{text}\n")
+            except RuntimeError:
+                self._stream_bubble = None
+
+    def add_error(self, t):
+        if self._stream_bubble:
+            try:
+                self._stream_bubble.append_text(f"\nError · {t}\n")
+            except RuntimeError:
+                self._stream_bubble = None
+            self.end_stream()
+        else:
+            self.add_message("error", t)
+
+    def add_diff(self, filepath, old, new):
+        """折叠式文件变更卡片"""
+        import html as _html
+        nm = Path(filepath).name if filepath else "unknown"
+        key = str(Path(filepath).as_posix()).lower() if filepath else f"unknown:{nm.lower()}"
+        light = _is_light_theme()
+        card_bg = "#f8fafc" if light else C_PANEL
+        card_bd = "#dbe3ee" if light else "transparent"
+        name_col = "#0f172a" if light else C_TEXT
+        detail_bg = "#ffffff" if light else "transparent"
+        detail_col = "#1f2937" if light else C_TEXT
+        arrow_col = "#475569" if light else C_TEXT
+        dim_col = "#64748b" if light else C_DIM
+
+        def _build_fragment() -> str:
+            ts = datetime.now().strftime("%H:%M:%S")
+            dt = f"<span style='color:{dim_col};font-size:10px'>[{ts}]</span><br>"
+            for ln in old.split('\n'):
+                dt += f"<span style='color:#ef4444'>- {_html.escape(ln)}</span><br>"
+            if old and new:
+                dt += f"<span style='color:{dim_col}'>→</span><br>"
+            for ln in new.split('\n'):
+                dt += f"<span style='color:#22c55e'>+ {_html.escape(ln)}</span><br>"
+            return dt
+
+        existing = self._diff_cards.get(key)
+        if existing and existing.get("card") is not None:
+            parts = existing.get("parts", [])
+            parts.append(_build_fragment())
+            parts = parts[-24:]
+            existing["parts"] = parts
+            detail = existing["detail"]
+            detail.setHtml("<br>".join(parts))
+            QTimer.singleShot(30, self._scroll)
+            return
+
+        card = QFrame(self.msg_container)
+        card.setStyleSheet(
+            f"QFrame{{background:{card_bg};border:1px solid {card_bd};border-radius:12px;margin:4px 10px}}"
+        )
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(8, 6, 8, 6)
+        cl.setSpacing(4)
+
+        hdr = QHBoxLayout()
+        ic = QLabel(card)
+        ic.setPixmap(quark_icon("file", 15).pixmap(15, 15))
+        ic.setStyleSheet("background:transparent")
+        hdr.addWidget(ic)
+        nm_lbl = QLabel(f"<b>{nm}</b>", card)
+        nm_lbl.setStyleSheet(f"color:{name_col};background:transparent;font-size:12px")
+        hdr.addWidget(nm_lbl)
+        hdr.addStretch()
+        toggle = QLabel(card)
+        toggle.setPixmap(quark_icon("chevron_right", 12, arrow_col).pixmap(12, 12))
+        toggle.setStyleSheet("background:transparent")
+        hdr.addWidget(toggle)
+        cl.addLayout(hdr)
+
+        detail = QTextEdit(card)
+        detail.setReadOnly(True)
+        detail.setFrameShape(QFrame.Shape.NoFrame)
+        detail.setFont(QFont("Consolas", 10))
+        detail.setMaximumHeight(200)
+        detail.hide()
+        detail.setStyleSheet(f"QTextEdit{{background:{detail_bg};color:{detail_col};border:none;}}")
+        parts = [_build_fragment()]
+        detail.setHtml(parts[0])
+        cl.addWidget(detail)
+
+        def toggle_diff(e=None):
+            if detail.isHidden():
+                detail.show()
+                toggle.setPixmap(quark_icon("chevron_down", 12, arrow_col).pixmap(12, 12))
+            else:
+                detail.hide()
+                toggle.setPixmap(quark_icon("chevron_right", 12, arrow_col).pixmap(12, 12))
+
+        card.mousePressEvent = toggle_diff
+        self._diff_cards[key] = {"card": card, "detail": detail, "parts": parts}
+        self.msg_layout.insertWidget(max(0, self.msg_layout.count() - 1), card)
+        QTimer.singleShot(30, self._scroll)
+
+    def add_review_card(self, filepath, old, new, on_accept, on_reject):
+        """代码审阅卡片（Accept/Reject 按钮）"""
+        import html as _html
+        from theme import C_RED
+        nm = Path(filepath).name if filepath else "unknown"
+        light = _is_light_theme()
+        card_bg = "#f8fafc" if light else C_PANEL
+        card_bd = "#dbe3ee" if light else "transparent"
+        title_col = "#0f172a" if light else C_TEXT
+        diff_bg = "#ffffff" if light else "transparent"
+        diff_col = "#1f2937" if light else C_TEXT
+        dim_col = "#64748b" if light else C_DIM
+        card = QFrame(self.msg_container)
+        card.setStyleSheet(
+            f"QFrame{{background:{card_bg};border:1px solid {card_bd};border-radius:14px;margin:4px 10px}}"
+        )
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(12, 8, 12, 8)
+        cl.setSpacing(6)
+        title = QLabel(f"<b>Review: {nm}</b>", card)
+        title.setStyleSheet(f"color:{title_col};background:transparent;")
+        cl.addWidget(title)
+        diff = QTextEdit(card)
+        diff.setReadOnly(True)
+        diff.setFrameShape(QFrame.Shape.NoFrame)
+        diff.setFont(QFont("Consolas", 11))
+        diff.setMaximumHeight(200)
+        diff.setStyleSheet(f"QTextEdit{{background:{diff_bg};color:{diff_col};border:none;}}")
+        dt = ""
+        for ln in old.split('\n'):
+            dt += f"<span style='color:#ef4444'>- {_html.escape(ln)}</span><br>"
+        dt += f"<span style='color:{dim_col}'>→</span><br>"
+        for ln in new.split('\n'):
+            dt += f"<span style='color:#22c55e'>+ {_html.escape(ln)}</span><br>"
+        diff.setHtml(dt)
+        cl.addWidget(diff)
+        bl = QHBoxLayout()
+        acc = QPushButton("Accept", card)
+        acc.clicked.connect(lambda: (on_accept(), card.hide()))
+        rej = QPushButton("Reject", card)
+        rej.setStyleSheet(_with_tooltip_style(f"QPushButton{{background:{C_RED}}}QPushButton:hover{{background:#dc2626}}"))
+        rej.clicked.connect(lambda: (on_reject(), card.hide()))
+        bl.addWidget(acc)
+        bl.addWidget(rej)
+        cl.addLayout(bl)
+        self.msg_layout.insertWidget(max(0, self.msg_layout.count() - 1), card)
+        QTimer.singleShot(30, self._scroll)
+
+    def _scroll(self):
+        sb = self.scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())

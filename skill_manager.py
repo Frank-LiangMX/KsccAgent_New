@@ -78,6 +78,7 @@ class Skill:
     success_count: int = 0
     last_used_at: str = ""
     enabled: bool = True
+    execution_plan: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Skill":
@@ -89,10 +90,11 @@ class Skill:
             success_count=int(data.get("success_count", 0) or 0),
             last_used_at=str(data.get("last_used_at", "") or ""),
             enabled=bool(data.get("enabled", True)),
+            execution_plan=list(data.get("execution_plan", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "id": self.id,
             "name": self.name,
             "intent_pattern": self.intent_pattern,
@@ -101,6 +103,9 @@ class Skill:
             "last_used_at": self.last_used_at,
             "enabled": self.enabled,
         }
+        if self.execution_plan:
+            d["execution_plan"] = self.execution_plan
+        return d
 
 
 @dataclass
@@ -160,6 +165,7 @@ class SkillManager:
         steps: list[str],
         skill_id: Optional[str] = None,
         enabled: bool = True,
+        execution_plan: Optional[list[dict[str, Any]]] = None,
     ) -> Skill:
         """Create new skill. For updates use update_skill_full."""
         skills, order = self._load_index()
@@ -178,6 +184,7 @@ class SkillManager:
             success_count=0,
             last_used_at="",
             enabled=enabled,
+            execution_plan=execution_plan or [],
         )
         self._write_skill_file(skill)
         skills[skill.id] = {
@@ -282,6 +289,11 @@ class SkillManager:
                 score += 6.0
             elif age_days <= 14:
                 score += 3.0
+            # 退化系数：长期未使用降低权重
+            elif age_days > 60:
+                score *= 0.2  # 60天以上未使用，权重降至20%
+            elif age_days > 30:
+                score *= 0.5  # 30天以上未使用，权重降至50%
         return score
 
     def match_detailed(self, prompt: str, top_k: int = 8) -> SkillMatchResult:
@@ -296,6 +308,8 @@ class SkillManager:
                 miss_reason="no_skills",
                 hint="尚未配置任何 Skill。可在设置中管理 Skills，或完成任务后选择保存为 Skill。",
             )
+        # 退化检测：禁用长期未使用的 skill
+        self._check_and_degrade_skills()
         skills, order = self._load_index()
         ranked: list[tuple[float, Skill]] = []
         pos = {sid: i for i, sid in enumerate(order)}
@@ -316,6 +330,42 @@ class SkillManager:
             )
         return SkillMatchResult(best=top[0][1], candidates=top, miss_reason="", hint="")
 
+    def _check_and_degrade_skills(self):
+        """检查并禁用长期未使用的 skill"""
+        skills, order = self._load_index()
+        now = datetime.now(timezone.utc)
+        degraded = []
+
+        for sid in list(skills.keys()):
+            skill_data = skills[sid]
+            if not skill_data.get("enabled", True):
+                continue
+
+            last_used = skill_data.get("last_used_at", "")
+            if not last_used:
+                # 从未使用过，检查创建时间（如果有）
+                continue
+
+            lu = _parse_iso(last_used)
+            if not lu:
+                continue
+
+            age_days = (now - lu).total_seconds() / 86400.0
+
+            # 90天以上未使用，自动禁用
+            if age_days > 90:
+                skill_data["enabled"] = False
+                degraded.append((sid, age_days))
+                # 更新 skill 文件
+                sk = self.load_skill(sid)
+                if sk:
+                    sk.enabled = False
+                    self._write_skill_file(sk)
+
+        if degraded:
+            self._save_index(skills, order)
+            skill_debug_log(f"Degraded {len(degraded)} skills: {degraded}", True)
+
     def match(self, prompt: str) -> Optional[Skill]:
         return self.match_detailed(prompt).best
 
@@ -331,3 +381,71 @@ class SkillManager:
             sk.success_count = int(sk.success_count or 0) + 1
             sk.last_used_at = skills[skill_id]["last_used_at"]
             self._write_skill_file(sk)
+
+    def calculate_similarity(self, skill1: Skill, skill2: Skill) -> float:
+        """计算两个 skill 的相似度 (0-1)"""
+        if not skill1.intent_pattern or not skill2.intent_pattern:
+            return 0.0
+
+        # 关键词重叠度
+        kw1 = set(skill1.intent_pattern)
+        kw2 = set(skill2.intent_pattern)
+        if not kw1 or not kw2:
+            return 0.0
+
+        intersection = len(kw1 & kw2)
+        union = len(kw1 | kw2)
+        keyword_similarity = intersection / union if union > 0 else 0.0
+
+        # 步骤相似度（简单比较步骤数量和内容）
+        steps1 = set(skill1.steps)
+        steps2 = set(skill2.steps)
+        if steps1 and steps2:
+            step_intersection = len(steps1 & steps2)
+            step_union = len(steps1 | steps2)
+            step_similarity = step_intersection / step_union if step_union > 0 else 0.0
+        else:
+            step_similarity = 0.0
+
+        # 加权平均
+        return keyword_similarity * 0.7 + step_similarity * 0.3
+
+    def find_similar_skills(self, threshold: float = 0.6) -> list[tuple[Skill, Skill, float]]:
+        """查找相似的 skill 对"""
+        skills = self.list_skills()
+        similar_pairs = []
+
+        for i, skill1 in enumerate(skills):
+            for skill2 in skills[i+1:]:
+                similarity = self.calculate_similarity(skill1, skill2)
+                if similarity >= threshold:
+                    similar_pairs.append((skill1, skill2, similarity))
+
+        # 按相似度降序排序
+        similar_pairs.sort(key=lambda x: x[2], reverse=True)
+        return similar_pairs
+
+    def resolve_conflict(self, skill1_id: str, skill2_id: str, keep_id: str) -> bool:
+        """解决冲突：保留一个，禁用另一个"""
+        skills, order = self._load_index()
+
+        if keep_id not in skills:
+            return False
+
+        # 确定要禁用的 skill
+        disable_id = skill2_id if keep_id == skill1_id else skill1_id
+        if disable_id not in skills:
+            return False
+
+        # 禁用
+        skills[disable_id]["enabled"] = False
+        self._save_index(skills, order)
+
+        # 更新 skill 文件
+        sk = self.load_skill(disable_id)
+        if sk:
+            sk.enabled = False
+            self._write_skill_file(sk)
+
+        skill_debug_log(f"Resolved conflict: kept {keep_id}, disabled {disable_id}", True)
+        return True

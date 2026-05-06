@@ -20,6 +20,10 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QWidget,
     QFormLayout,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
 )
 
 from config import load_config
@@ -175,12 +179,14 @@ class SkillsManagerDialog(QDialog):
         self.btn_up = QPushButton("上移")
         self.btn_dn = QPushButton("下移")
         self.btn_save = QPushButton("保存当前")
+        self.btn_stats = QPushButton("统计")
         self.btn_new.clicked.connect(self._new_skill)
         self.btn_del.clicked.connect(self._del_skill)
         self.btn_up.clicked.connect(lambda: self._move(-1))
         self.btn_dn.clicked.connect(lambda: self._move(1))
         self.btn_save.clicked.connect(self._save_current)
-        for b in (self.btn_new, self.btn_del, self.btn_up, self.btn_dn, self.btn_save):
+        self.btn_stats.clicked.connect(self._show_stats)
+        for b in (self.btn_new, self.btn_del, self.btn_up, self.btn_dn, self.btn_save, self.btn_stats):
             btn_row.addWidget(b)
         pl.addLayout(btn_row)
         pl.addStretch(1)
@@ -298,3 +304,89 @@ class SkillsManagerDialog(QDialog):
         sk.enabled = bool(checked)
         self._mgr.update_skill_full(sk)
         self._reload_list(select_id=sid)
+
+    def _show_stats(self):
+        """显示统计对话框"""
+        dlg = SkillStatsDialog(self._mgr, self)
+        dlg.exec()
+
+
+class SkillStatsDialog(QDialog):
+    """Skill 统计面板"""
+
+    def __init__(self, mgr: SkillManager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Skill 统计")
+        self.resize(600, 450)
+        self.setStyleSheet(_dialog_style())
+        self._mgr = mgr
+
+        layout = QVBoxLayout(self)
+
+        # 概览标签
+        self._overview_label = QLabel()
+        self._overview_label.setWordWrap(True)
+        layout.addWidget(self._overview_label)
+
+        # 表格
+        self._table = QTableWidget()
+        self._table.setColumnCount(6)
+        self._table.setHorizontalHeaderLabels(["ID", "名称", "状态", "使用次数", "最后使用", "相似警告"])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self._table)
+
+        # 相似 skill 警告
+        self._similar_label = QLabel()
+        self._similar_label.setWordWrap(True)
+        layout.addWidget(self._similar_label)
+
+        # 刷新按钮
+        btn_row = QHBoxLayout()
+        btn_refresh = QPushButton("刷新")
+        btn_refresh.clicked.connect(self._refresh)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_refresh)
+        layout.addLayout(btn_row)
+
+        self._refresh()
+
+    def _refresh(self):
+        """刷新统计数据"""
+        skills = self._mgr.list_skills()
+        total = len(skills)
+        enabled = sum(1 for s in skills if s.enabled)
+        disabled = total - enabled
+        total_uses = sum(s.success_count for s in skills)
+
+        # 概览
+        self._overview_label.setText(
+            f"<b>总览</b><br>"
+            f"总 Skill 数: {total}<br>"
+            f"启用: {enabled} | 禁用: {disabled}<br>"
+            f"总使用次数: {total_uses}"
+        )
+
+        # 表格
+        self._table.setRowCount(total)
+        for i, sk in enumerate(skills):
+            self._table.setItem(i, 0, QTableWidgetItem(sk.id))
+            self._table.setItem(i, 1, QTableWidgetItem(sk.name))
+            status = "启用" if sk.enabled else "禁用"
+            self._table.setItem(i, 2, QTableWidgetItem(status))
+            self._table.setItem(i, 3, QTableWidgetItem(str(sk.success_count)))
+            last_used = sk.last_used_at[:10] if sk.last_used_at else "从未"
+            self._table.setItem(i, 4, QTableWidgetItem(last_used))
+            self._table.setItem(i, 5, QTableWidgetItem(""))
+
+        # 相似 skill 检测
+        similar_pairs = self._mgr.find_similar_skills(threshold=0.6)
+        if similar_pairs:
+            warnings = []
+            for s1, s2, sim in similar_pairs[:5]:  # 最多显示5个
+                warnings.append(f"• {s1.name} ↔ {s2.name} (相似度: {sim:.0%})")
+            self._similar_label.setText(
+                f"<b>相似 Skill 警告</b><br>" + "<br>".join(warnings)
+            )
+        else:
+            self._similar_label.setText("<b>相似 Skill 警告</b><br>无相似 Skill")

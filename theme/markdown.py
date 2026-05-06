@@ -9,17 +9,21 @@ def md_chat_to_html(text: str, light: bool = False) -> str:
     """Convert basic markdown to HTML for QTextEdit display."""
     if light:
         pre_bg = "rgba(0,0,0,0.06)"
-        code_bg = "rgba(0,0,0,0.08)"
+        code_bg = "rgba(15,23,42,0.06)"
         code_fg = "#000000"
+        inline_code_fg = "#f8654b"
+        inline_code_bd = "rgba(15,23,42,0.10)"
         btn_bg = "rgba(0,0,0,0.08)"
         btn_bg_h = "rgba(0,0,0,0.14)"
     else:
         pre_bg = "rgba(255,255,255,0.06)"
-        code_bg = "rgba(255,255,255,0.08)"
+        code_bg = "rgba(255,255,255,0.07)"
         code_fg = C_TEXT
+        inline_code_fg = "#f8654b"
+        inline_code_bd = "rgba(255,255,255,0.12)"
         btn_bg = "rgba(255,255,255,0.10)"
         btn_bg_h = "rgba(255,255,255,0.16)"
-    t = text
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
     t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     code_idx = 0
@@ -54,7 +58,8 @@ def md_chat_to_html(text: str, light: bool = False) -> str:
     t = re.sub(r"```(\w*)\n(.*?)```", _codeblock, t, flags=re.DOTALL)
     t = re.sub(
         r"`([^`]+)`",
-        rf'<code style="background:{code_bg};padding:2px 8px;border-radius:6px;font-size:11px;color:{code_fg}">\1</code>',
+        rf'<code style="background:{code_bg};padding:1px 6px;border-radius:7px;'
+        rf'font-size:11px;font-weight:600;color:{inline_code_fg};border:1px solid {inline_code_bd}">\1</code>',
         t,
     )
     # --- markdown table ---
@@ -95,7 +100,9 @@ def md_chat_to_html(text: str, light: bool = False) -> str:
     t = re.sub(r"^# (.+)$", r'<h2 style="margin:4px 0">\1</h2>', t, flags=re.MULTILINE)
     t = re.sub(r"^- (.+)$", r"<li>\1</li>", t, flags=re.MULTILINE)
     t = re.sub(r"(<li>.*?</li>\n?)+", r"<ul>\g<0></ul>", t, flags=re.DOTALL)
+    t = re.sub(r"\n{2,}", "\n", t)
     t = t.replace("\n", "<br>")
+    t = re.sub(r"(?:<br>\s*){2,}", "<br>", t)
     for key, html in code_blocks.items():
         t = t.replace(key, html)
     return f'<div style="font-size:12px;line-height:1.5">{t}</div>'

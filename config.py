@@ -57,6 +57,14 @@ class Config:
     skills_enabled: bool = True
     skill_debug_log: bool = False
     memory_injection_enabled: bool = True
+    auto_save_skill_threshold: float = 75.0  # 自动保存 skill 的分数阈值
+    # P5-5: Feature flags
+    feature_task_mode: bool = True          # 任务状态机模式
+    feature_insight_index: bool = True      # Insight 记忆层
+    feature_memory_compress: bool = True    # 记忆自动压缩
+    feature_risk_templates: bool = True     # 风控模板检测
+    feature_evidence_capture: bool = True   # 网页/设备证据采集
+    feature_adb_tools: bool = False         # ADB 设备工具（默认关闭，需手动开启）
 
 
 @dataclass
@@ -155,6 +163,13 @@ def load_config() -> Config:
                 "skills_enabled",
                 "skill_debug_log",
                 "memory_injection_enabled",
+                "auto_save_skill_threshold",
+                "feature_task_mode",
+                "feature_insight_index",
+                "feature_memory_compress",
+                "feature_risk_templates",
+                "feature_evidence_capture",
+                "feature_adb_tools",
             ):
                 if key in data:
                     setattr(cfg, key, data[key])
@@ -211,6 +226,13 @@ def save_config(cfg: Config):
         "skills_enabled": cfg.skills_enabled,
         "skill_debug_log": cfg.skill_debug_log,
         "memory_injection_enabled": cfg.memory_injection_enabled,
+        "auto_save_skill_threshold": cfg.auto_save_skill_threshold,
+        "feature_task_mode": cfg.feature_task_mode,
+        "feature_insight_index": cfg.feature_insight_index,
+        "feature_memory_compress": cfg.feature_memory_compress,
+        "feature_risk_templates": cfg.feature_risk_templates,
+        "feature_evidence_capture": cfg.feature_evidence_capture,
+        "feature_adb_tools": cfg.feature_adb_tools,
     }
     CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 

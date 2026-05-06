@@ -14,53 +14,51 @@ import json
 import mimetypes
 import os
 import re
-import subprocess
-import sys
-import time
-import traceback
 from pathlib import Path
-from typing import AsyncGenerator, Callable, Optional, Union
-
-import httpx
+from typing import AsyncGenerator, Callable, Optional
 
 from config import Config, ProviderConfig, load_config, get_active_provider
 from context import ContextTracker, count_messages_tokens, count_tokens, get_max_output
 import memory_store
+import insight_index
 from skill_manager import Skill, SkillManager, SkillMatchResult, skill_debug_log
+from skill_scorer import score_skill_draft, is_worth_saving, get_score_label
+from tool_executor import ToolExecutor, TOOL_REGISTRY, RiskLevel, classify_shell_risk, is_dangerous_shell, match_risk_template
+from llm_client import OpenAIBackend, AnthropicBackend, KsccBackend, create_backend
 
 # ══════════════════════════════════════════════════════════════
 #  System Prompt
 # ══════════════════════════════════════════════════════════════
 
 _MODE_DESCRIPTIONS = {
-    "solo": "You work autonomously. Execute tools directly, verify your work, and report results. Keep iterating until the task is complete.",
-    "ide": "You propose changes for user review. When you want to modify a file, explain what you plan to do and call the tool. The user will approve or reject each action. Use read_file and search tools freely without confirmation.",
+    "solo": "你以自主模式工作。直接调用工具执行任务、验证结果并持续迭代，直到任务完成。",
+    "ide": "你在 IDE 审阅模式下工作。进行文件修改前先说明计划并调用工具，由用户逐步批准或拒绝。只读类操作可直接执行。",
 }
 
-SYSTEM_PROMPT = """You are Kscc, an AI coding assistant that helps users with software engineering tasks.
+SYSTEM_PROMPT = """你是 Kscc，一名 AI 编程助手，帮助用户完成软件工程任务。
 
-## Your Capabilities
-- Read, write, and edit files in the workspace
-- Execute shell commands
-- Search code with regex patterns
-- Find files by glob patterns
-- List directory contents
+## 你的能力
+- 读取、写入和编辑工作区文件
+- 执行 Shell 命令
+- 使用正则搜索代码
+- 使用 glob 查找文件
+- 列出目录内容
 
-## Guidelines
-- Be concise and direct. Answer the user's question without unnecessary preamble.
-- When making file changes, use edit_file for targeted edits rather than rewriting entire files.
-- Read files before editing them to understand their content and conventions.
-- Follow existing code conventions (naming, imports, patterns) when making changes.
-- NEVER guess URLs or file paths - use search tools to find them first.
-- When executing shell commands, prefer non-interactive commands.
-- After completing a task, verify your work by reading the changed file or running tests.
+## 行为准则
+- 回复简洁直接，不要冗余前言。
+- 修改文件时优先使用精确编辑，不要无必要整文件重写。
+- 编辑前先读取上下文，遵循现有代码风格。
+- 不要臆造路径和 URL，先用搜索工具定位。
+- 执行命令时优先非交互命令。
+- 完成任务后做基本自检（读回改动或运行测试）。
+- 默认使用简体中文输出；仅当用户明确要求英文时才使用英文。
 
-## Mode
+## 模式
 {mode_description}
 
-## Workspace
-The current working directory is: {workspace}
-Use relative paths from this directory when possible."""
+## 工作目录
+当前工作目录：{workspace}
+尽量使用相对路径。"""
 
 
 # ══════════════════════════════════════════════════════════════
@@ -189,6 +187,21 @@ TOOLS_OPENAI = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "adb_command",
+            "description": "Executes an ADB (Android Debug Bridge) command on a connected device. Use for Android device automation: install apps, push/pull files, run shell commands on device, capture screenshots, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "ADB subcommand (e.g., 'devices', 'shell ls /sdcard', 'install app.apk', 'pull /sdcard/file.txt .')"},
+                    "device": {"type": "string", "description": "Optional device serial number when multiple devices are connected"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
 
 TOOLS_ANTHROPIC = [
@@ -289,626 +302,21 @@ TOOLS_ANTHROPIC = [
             "required": ["url"],
         },
     },
+    {
+        "name": "adb_command",
+        "description": "Executes an ADB (Android Debug Bridge) command on a connected device. Use for Android device automation: install apps, push/pull files, run shell commands on device, capture screenshots, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "ADB subcommand (e.g., 'devices', 'shell ls /sdcard', 'install app.apk', 'pull /sdcard/file.txt .')"},
+                "device": {"type": "string", "description": "Optional device serial number when multiple devices are connected"},
+            },
+            "required": ["command"],
+        },
+    },
 ]
 
 TOOL_NAMES = [t["function"]["name"] for t in TOOLS_OPENAI]
-
-
-# ══════════════════════════════════════════════════════════════
-#  Tool Executor
-# ══════════════════════════════════════════════════════════════
-
-class ToolExecutor:
-    def __init__(self, workspace: str):
-        self.workspace = Path(workspace).resolve()
-
-    def _safe_path(self, path: str) -> Path:
-        """Resolve path safely against workspace, prevent traversal."""
-        p = Path(path)
-        if not p.is_absolute():
-            p = self.workspace / p
-        p = p.resolve()
-        # 允许读取 workspace 外的文件（如系统配置），但给出警告
-        return p
-
-    def execute(self, name: str, args: dict) -> str:
-        try:
-            if name == "read_file":
-                return self._read_file(args)
-            elif name == "write_file":
-                return self._write_file(args)
-            elif name == "edit_file":
-                return self._edit_file(args)
-            elif name == "glob_files":
-                return self._glob_files(args)
-            elif name == "search_content":
-                return self._search_content(args)
-            elif name == "run_shell":
-                return self._run_shell(args)
-            elif name == "list_directory":
-                return self._list_directory(args)
-            elif name == "web_fetch":
-                return self._web_fetch(args)
-            else:
-                return f"Unknown tool: {name}"
-        except Exception as e:
-            return f"ToolError: {type(e).__name__}: {e}"
-
-    def preview(self, name: str, args: dict) -> str:
-        """Generate a human-readable preview for IDE mode."""
-        if name == "read_file":
-            return f"Read: {self._shorten(args.get('path', ''), 60)}"
-        elif name == "write_file":
-            return f"Write: {self._shorten(args.get('path', ''), 60)} ({len(args.get('content', ''))} chars)"
-        elif name == "edit_file":
-            p = self._shorten(args.get('path', ''), 50)
-            old = self._shorten(args.get('old_string', ''), 40)
-            return f"Edit: {p}\n  - {old}"
-        elif name == "glob_files":
-            return f"Glob: {args.get('pattern', '')}"
-        elif name == "search_content":
-            return f"Search: /{self._shorten(args.get('pattern', ''), 40)}/"
-        elif name == "run_shell":
-            return f"Shell: {self._shorten(args.get('command', ''), 80)}"
-        elif name == "list_directory":
-            return f"List: {args.get('path') or 'workspace root'}"
-        return f"{name}: {json.dumps(args, ensure_ascii=False)[:100]}"
-
-    def _read_file(self, args: dict) -> str:
-        path = self._safe_path(args["path"])
-        offset = args.get("offset", 0)
-        limit = args.get("limit") or 2000
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        total = len(lines)
-        if offset > 0:
-            lines = lines[offset - 1:]
-        if limit:
-            lines = lines[:limit]
-        result = "".join(lines)
-        header = f"[{path}] {len(lines)}/{total} lines"
-        if offset:
-            header += f" (offset={offset})"
-        return f"{header}\n\n{result}"
-
-    def _write_file(self, args: dict) -> str:
-        path = self._safe_path(args["path"])
-        content = args["content"]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"Wrote {len(content)} bytes to {path}"
-
-    def _edit_file(self, args: dict) -> str:
-        path = self._safe_path(args["path"])
-        old_str = args["old_string"]
-        new_str = args["new_string"]
-        content = path.read_text("utf-8")
-        count = content.count(old_str)
-        if count == 0:
-            return f"Error: old_string not found in {path}"
-        if count > 1:
-            return f"Error: old_string found {count} times in {path}, must be unique. Provide more context."
-        new_content = content.replace(old_str, new_str, 1)
-        path.write_text(new_content, "utf-8")
-        return f"Edited {path} (1 replacement)"
-
-    def _glob_files(self, args: dict) -> str:
-        pattern = args["pattern"]
-        base = self._safe_path(args.get("path") or str(self.workspace))
-        matches = sorted(base.glob(pattern))
-        if not matches:
-            return f"No files matched pattern: {pattern}"
-        lines = [str(m.relative_to(base) if m.is_relative_to(base) else m) for m in matches]
-        return f"Matched {len(matches)} files:\n" + "\n".join(lines[:200])
-
-    def _search_content(self, args: dict) -> str:
-        pattern = args["pattern"]
-        base = self._safe_path(args.get("path") or str(self.workspace))
-        include = args.get("include") or "*"
-        try:
-            regex = re.compile(pattern)
-        except re.error as e:
-            return f"Invalid regex pattern: {e}"
-        results = []
-        for f in base.rglob(include):
-            if not f.is_file():
-                continue
-            if any(p.startswith('.') for p in f.relative_to(base).parts):
-                continue
-            try:
-                content = f.read_text("utf-8", errors="replace")
-                for i, line in enumerate(content.splitlines(), 1):
-                    if regex.search(line):
-                        results.append(f"{f.relative_to(base)}:{i}: {line.strip()[:200]}")
-            except Exception:
-                continue
-        if not results:
-            return f"No matches for pattern: {pattern}"
-        return f"Found {len(results)} matches:\n" + "\n".join(results[:100])
-
-    def _run_shell(self, args: dict) -> str:
-        command = args["command"]
-        workdir = args.get("workdir") or str(self.workspace)
-        try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                cwd=workdir, timeout=120, encoding="utf-8", errors="replace",
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-            out = result.stdout.strip()
-            err = result.stderr.strip()
-            parts = []
-            if out:
-                parts.append(out)
-            if err:
-                parts.append(f"[stderr]\n{err}")
-            if result.returncode != 0:
-                parts.append(f"[exit code: {result.returncode}]")
-            return "\n".join(parts) if parts else f"[exit code: {result.returncode}]"
-        except subprocess.TimeoutExpired:
-            return "Error: command timed out (120s)"
-        except Exception as e:
-            return f"Error executing command: {e}"
-
-    def _list_directory(self, args: dict) -> str:
-        path = self._safe_path(args.get("path") or str(self.workspace))
-        if not path.exists():
-            return f"Path not found: {path}"
-        if not path.is_dir():
-            return f"Not a directory: {path}"
-        entries = sorted(path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
-        lines = []
-        for e in entries[:200]:
-            marker = "/" if e.is_dir() else ""
-            lines.append(f"  {e.name}{marker}")
-        heading = f"{path}" + ("/" if lines else " (empty)")
-        return heading + "\n" + "\n".join(lines) if lines else heading
-
-    def _web_fetch(self, args: dict) -> str:
-        url = args["url"]
-        import httpx
-        try:
-            r = httpx.get(url, timeout=15, follow_redirects=True, headers={
-                "User-Agent": "KsccAgent/1.0"
-            })
-            r.raise_for_status()
-            ct = r.headers.get("content-type", "")
-            if "text/html" in ct:
-                text = self._html_to_text(r.text)
-            else:
-                text = r.text
-            return text[:10000] + ("..." if len(text) > 10000 else "")
-        except Exception as e:
-            return f"WebFetch Error: {e}"
-
-    @staticmethod
-    def _html_to_text(html_text: str) -> str:
-        import re
-        text = re.sub(r'<script[^>]*>.*?</script>', '', html_text, flags=re.DOTALL|re.IGNORECASE)
-        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL|re.IGNORECASE)
-        text = re.sub(r'<[^>]+>', ' ', text)
-        text = re.sub(r'&[a-zA-Z]+;', ' ', text)
-        text = re.sub(r'&#\d+;', ' ', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text[:8000]
-
-    @staticmethod
-    def _shorten(text: str, max_len: int) -> str:
-        if len(text) <= max_len:
-            return text
-        return text[:max_len - 3] + "..."
-
-
-# ══════════════════════════════════════════════════════════════
-#  LLM 后端
-# ══════════════════════════════════════════════════════════════
-
-class OpenAIBackend:
-    def __init__(self, provider: ProviderConfig):
-        self.base_url = provider.base_url.rstrip("/")
-        self.model = provider.model
-        self.headers = {
-            "Authorization": f"Bearer {provider.api_key}",
-            "Content-Type": "application/json",
-            **(provider.extra_headers or {}),
-        }
-
-    async def chat(self, messages: list[dict], tools: list[dict], max_tokens: int = 16384) -> AsyncGenerator[dict, None]:
-        """流式调用 OpenAI-compatible API，yield 统一事件。"""
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "stream": True,
-            "stream_options": {"include_usage": True},
-            "max_tokens": max_tokens,
-        }
-        url = f"{self.base_url}/chat/completions"
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300)) as client:
-            async with client.stream("POST", url, json=body, headers=self.headers) as resp:
-                if resp.status_code != 200:
-                    text = await resp.aread()
-                    yield {"type": "error", "content": f"API Error {resp.status_code}: {text.decode()[:500]}"}
-                    return
-                tool_calls: dict[int, dict] = {}  # index -> accumulated tool call
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    # 捕获 usage 信息
-                    usage = chunk.get("usage")
-                    if usage:
-                        yield {"type": "usage", "input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)}
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    if "reasoning_content" in delta and delta["reasoning_content"]:
-                        yield {"type": "thinking", "text": delta["reasoning_content"]}
-                    if "content" in delta and delta["content"]:
-                        yield {"type": "text_delta", "text": delta["content"]}
-                    for tc in delta.get("tool_calls", []):
-                        idx = tc.get("index", 0)
-                        if idx not in tool_calls:
-                            tool_calls[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
-                        tc_obj = tool_calls[idx]
-                        if "id" in tc:
-                            tc_obj["id"] = tc["id"]
-                        if "function" in tc:
-                            if "name" in tc["function"]:
-                                tc_obj["function"]["name"] += tc["function"]["name"]
-                            if "arguments" in tc["function"]:
-                                tc_obj["function"]["arguments"] += tc["function"]["arguments"]
-                        yield {"type": "tool_delta", "index": idx, "name": tc_obj["function"]["name"], "arguments": tc_obj["function"]["arguments"]}
-                for tc in tool_calls.values():
-                    yield {"type": "tool_call_complete", "tool_call": tc}
-
-
-class AnthropicBackend:
-    def __init__(self, provider: ProviderConfig):
-        self.base_url = provider.base_url.rstrip("/")
-        self.model = provider.model
-        self.headers = {
-            "x-api-key": provider.api_key,
-            "anthropic-version": provider.extra_headers.get("anthropic-version", "2023-06-01"),
-            "Content-Type": "application/json",
-        }
-
-    async def chat(self, messages: list[dict], tools: list[dict], max_tokens: int = 16384) -> AsyncGenerator[dict, None]:
-        """流式调用 Anthropic API，yield 统一事件。"""
-        system = ""
-        anthropic_messages = []
-        for msg in messages:
-            if msg["role"] == "system":
-                system += msg["content"] + "\n"
-            elif msg["role"] == "tool":
-                converted = self._convert_message(msg)
-                if anthropic_messages and anthropic_messages[-1]["role"] == "user":
-                    anthropic_messages[-1]["content"].extend(converted["content"])
-                else:
-                    anthropic_messages.append(converted)
-            else:
-                anthropic_messages.append(self._convert_message(msg))
-
-        body = {
-            "model": self.model,
-            "messages": anthropic_messages,
-            "tools": tools,
-            "stream": True,
-            "max_tokens": max_tokens,
-        }
-        if system.strip():
-            body["system"] = system.strip()
-
-        url = f"{self.base_url}/messages"
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300)) as client:
-            async with client.stream("POST", url, json=body, headers=self.headers) as resp:
-                if resp.status_code != 200:
-                    text = await resp.aread()
-                    yield {"type": "error", "content": f"API Error {resp.status_code}: {text.decode()[:500]}"}
-                    return
-                current_event = None
-                tool_blocks: dict[int, dict] = {}  # index -> accumulated tool use
-                async for line in resp.aiter_lines():
-                    if line.startswith("event: "):
-                        current_event = line[7:]
-                    elif line.startswith("data: "):
-                        try:
-                            data = json.loads(line[6:])
-                        except json.JSONDecodeError:
-                            continue
-                        for e in self._process_sse(current_event, data, tool_blocks):
-                            yield e
-
-    def _process_sse(self, event: str, data: dict, tool_blocks: dict) -> list[dict]:
-        events = []
-        t = data.get("type", "")
-        if t == "content_block_delta":
-            delta = data.get("delta", {})
-            if delta.get("type") == "text_delta":
-                events.append({"type": "text_delta", "text": delta.get("text", "")})
-            elif delta.get("type") == "input_json_delta":
-                idx = data.get("index", 0)
-                if idx not in tool_blocks:
-                    tool_blocks[idx] = {"id": "", "name": "", "input_json": ""}
-                tool_blocks[idx]["input_json"] += delta.get("partial_json", "")
-                events.append({"type": "tool_delta", "index": idx, "name": tool_blocks[idx]["name"], "arguments": tool_blocks[idx]["input_json"]})
-        elif t == "content_block_start":
-            cb = data.get("content_block", {})
-            if cb.get("type") == "tool_use":
-                idx = data.get("index", 0)
-                tool_blocks[idx] = {"id": cb.get("id", ""), "name": cb.get("name", ""), "input_json": json.dumps(cb.get("input", {}))}
-        elif t == "message_delta":
-            usage = data.get("usage", {})
-            if usage:
-                return [{"type": "usage", "input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0)}]
-        elif t == "message_stop":
-            # 所有 tool_blocks 已完成
-            for idx, tb in tool_blocks.items():
-                try:
-                    args = tb["input_json"]
-                except Exception:
-                    args = "{}"
-                events.append({
-                    "type": "tool_call_complete",
-                    "tool_call": {
-                        "id": tb["id"],
-                        "type": "function",
-                        "function": {"name": tb["name"], "arguments": args if isinstance(args, str) else json.dumps(args)},
-                    },
-                })
-        return [e for e in events if e]
-
-    def _convert_message(self, msg: dict) -> dict:
-        role = msg["role"]
-        if role == "user":
-            return {"role": "user", "content": [{"type": "text", "text": msg.get("content", "")}]}
-        elif role == "tool":
-            return {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": msg.get("tool_call_id", ""), "content": msg.get("content", "")}
-            ]}
-        elif role == "assistant":
-            if msg.get("tool_calls"):
-                content = []
-                for tc in msg["tool_calls"]:
-                    content.append({
-                        "type": "tool_use",
-                        "id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "input": json.loads(tc["function"]["arguments"]),
-                    })
-                return {"role": "assistant", "content": content}
-            else:
-                return {"role": "assistant", "content": [{"type": "text", "text": msg.get("content", "")}]}
-        return msg
-
-
-def create_backend(provider: ProviderConfig):
-    if provider.name == "kscc":
-        return KsccBackend(provider)
-    if provider.name == "anthropic":
-        return AnthropicBackend(provider)
-    return OpenAIBackend(provider)
-
-
-# ══════════════════════════════════════════════════════════════
-#  Kscc Backend（公司内部 kscc CLI，stream-json 模式）
-# ══════════════════════════════════════════════════════════════
-
-class KsccBackend:
-    def __init__(self, provider: ProviderConfig):
-        self.bin = self._find_bin(provider.base_url)
-        self.model = provider.model or ""
-        self.workspace = str(Path.cwd())
-        self._proc = None
-
-    @staticmethod
-    def _find_bin(hint: str) -> str:
-        """找到 kscc 可执行文件路径"""
-        import shutil
-        for name in (hint, "kscc", "kscc.cmd", "kscc.ps1"):
-            found = shutil.which(name)
-            if found:
-                return found
-        # 查找 npm 全局安装路径
-        npm_dir = Path(os.environ.get("APPDATA", "")) / "npm"
-        for name in ("kscc.cmd", "kscc.ps1", "kscc"):
-            p = npm_dir / name
-            if p.exists():
-                return str(p)
-        return hint
-
-    async def _ensure_process(self):
-        if self._proc and self._proc.returncode is None:
-            return
-        import asyncio
-        cmd = [
-            self.bin, "--print", "--verbose",
-            "--output-format", "stream-json",
-            "--input-format", "stream-json",
-            "--dangerously-skip-permissions",
-        ]
-        if self.model and self.model != "default":
-            cmd += ["--model", self.model]
-        env = os.environ.copy()
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
-        if api_key:
-            env["ANTHROPIC_API_KEY"] = api_key
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.workspace,
-            env=env,
-            creationflags=creationflags,
-        )
-        self._proc.stdout._limit = 50 * 1024 * 1024
-
-    async def _send(self, data: dict):
-        line = json.dumps(data, ensure_ascii=False) + "\n"
-        self._proc.stdin.write(line.encode("utf-8"))
-        await self._proc.stdin.drain()
-
-    async def _read_line(self) -> Optional[dict]:
-        if not self._proc or self._proc.returncode is not None:
-            return None
-        try:
-            line = await self._proc.stdout.readline()
-        except Exception:
-            return None
-        if not line:
-            return None
-        text = line.decode("utf-8", errors="replace").strip()
-        if not text:
-            return None
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return None
-
-    @staticmethod
-    def _msg_text(content) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(str(block.get("text", "")))
-                else:
-                    parts.append(str(block))
-            return "\n".join([p for p in parts if p])
-        return str(content or "")
-
-    def _build_transcript(self, messages: list[dict], latest_user_text: str) -> str:
-        """
-        kscc CLI stream-json --print currently doesn't accept OpenAI-style message arrays.
-        We inject a compact transcript to preserve local context without relying on process persistence.
-        """
-        transcript = []
-        for m in messages[-18:]:
-            role = m.get("role", "")
-            if role == "system":
-                continue
-            txt = self._msg_text(m.get("content", ""))
-            if not txt.strip():
-                continue
-            if role == "user":
-                transcript.append(f"[User]\n{txt.strip()}")
-            elif role == "assistant":
-                transcript.append(f"[Assistant]\n{txt.strip()}")
-            elif role == "tool":
-                transcript.append(f"[ToolResult]\n{txt.strip()}")
-        if not transcript:
-            return latest_user_text
-        merged = "\n\n".join(transcript)
-        if len(merged) > 18000:
-            merged = merged[-18000:]
-        return (
-            "Conversation transcript:\n"
-            f"{merged}\n\n"
-            "Continue the conversation and answer the latest user message."
-        )
-
-    async def chat(self, messages: list[dict], tools: list[dict], max_tokens: int = 16384) -> AsyncGenerator[dict, None]:
-        await self._ensure_process()
-
-        user_text = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                user_text = str(m.get("content", ""))
-                break
-        if not user_text:
-            yield {"type": "error", "content": "No user message found"}
-            return
-
-        kscc_input = self._build_transcript(messages, user_text)
-        await self._send({"type": "user", "message": {"role": "user", "content": kscc_input}})
-
-        acc_text = ""
-        tool_calls = {}
-        try:
-            while True:
-                msg = await self._read_line()
-                if msg is None:
-                    yield {"type": "error", "content": "kscc process ended unexpectedly"}
-                    return
-
-                t = msg.get("type", "")
-                if t == "assistant":
-                    blocks = msg.get("message", {}).get("content", [])
-                    for block in blocks:
-                        if not isinstance(block, dict):
-                            continue
-                        bt = block.get("type", "")
-                        if bt == "text":
-                            text = block.get("text", "")
-                            acc_text += text
-                            yield {"type": "text_delta", "text": text}
-                        elif bt == "thinking":
-                            yield {"type": "thinking", "text": block.get("thinking", "")}
-                        elif bt == "tool_use":
-                            name = block.get("name", "")
-                            inp = block.get("input", {})
-                            yield {"type": "kscc_tool", "name": name, "input": inp}
-                            # kscc 的 Edit/Write 工具也产生 diff 预览
-                            if name in ("Edit", "Write"):
-                                path = inp.get("file_path", "")
-                                old_s = inp.get("old_string", "")
-                                new_s = inp.get("new_string", "") or inp.get("content", "")
-                                if path and (old_s or new_s):
-                                    yield {
-                                        "type": "tool_call",
-                                        "name": "edit_file",
-                                        "arguments": {"path": path, "old_string": old_s, "new_string": new_s},
-                                        "preview": f"Edit: {path}",
-                                    }
-                elif t == "user":
-                    pass  # kscc 内部 tool_result，跳过
-                elif t == "result":
-                    subtype = msg.get("subtype", "")
-                    if subtype == "success":
-                        usage = msg.get("usage", {})
-                        yield {
-                            "type": "usage",
-                            "input_tokens": usage.get("input_tokens", 0),
-                            "output_tokens": usage.get("output_tokens", 0),
-                        }
-                        yield {"type": "result_end"}
-                        return
-                    else:
-                        yield {"type": "error", "content": str(msg.get("errors", "kscc error"))}
-                        yield {"type": "result_end"}
-                        return
-                elif t == "system":
-                    # init, 跳过
-                    pass
-        except Exception as e:
-            yield {"type": "error", "content": f"kscc stream error: {e}"}
-
-    def close(self):
-        """Best-effort shutdown to avoid unclosed proactor transport warnings on Windows."""
-        proc = self._proc
-        self._proc = None
-        if not proc:
-            return
-        try:
-            if proc.stdin and not proc.stdin.is_closing():
-                proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            if proc.returncode is None:
-                proc.terminate()
-        except Exception:
-            pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -922,9 +330,9 @@ class Agent:
         provider = get_active_provider(self.config)
         if provider.name != "kscc" and not provider.api_key:
             raise ValueError(f"API key not set for provider '{provider.name}'. Set env var or config.json.")
-        self.backend = create_backend(provider)
+        self.backend = create_backend(provider, workspace=self.config.workspace)
         self.provider_name = provider.name
-        self.tools = ToolExecutor(self.config.workspace)
+        self.tools = ToolExecutor(self.config.workspace, config=self.config)
         self.ctx = ContextTracker(model=provider.model, context_limit=provider.context_limit or self.config.context_limit)
         # 输出上限：用户设置 > 模型默认表 > 16384
         self.max_output = provider.max_output_tokens or self.config.max_output_tokens or get_max_output(provider.model)
@@ -961,6 +369,9 @@ class Agent:
         self._confirm_event = asyncio.Event()
         self._run_user_prompt = prompt or ""
         self._skill_match_result = None
+        self._collected_tool_calls = []  # 收集工具调用用于评分
+        self._collected_tool_results = []  # 收集工具结果用于评分
+        self._recorded_execution_plan = []  # 录制工具调用链用于 Skill 回放
         dbg = bool(getattr(self.config, "skill_debug_log", False))
         skills_on = bool(getattr(self.config, "skills_enabled", True))
 
@@ -998,6 +409,22 @@ class Agent:
                 }
             effective_prompt = self._augment_prompt_with_skill(prompt, mr)
 
+        # P3-2: Classify task type for selective memory injection
+        task_types = insight_index.classify_task_type(effective_prompt) if getattr(self.config, 'feature_insight_index', True) else []
+
+        # P4-5: 敏感任务风控模板检测
+        risk_template = match_risk_template(prompt) if getattr(self.config, 'feature_risk_templates', True) else None
+        if risk_template:
+            yield {
+                "type": "risk_template",
+                "template_id": risk_template["template_id"],
+                "name": risk_template["name"],
+                "risk_level": risk_template["risk_level"],
+                "require_reason": risk_template.get("require_reason", False),
+                "require_confirmation": risk_template.get("require_confirmation", True),
+                "block_auto_execute": risk_template.get("block_auto_execute", False),
+            }
+
         # 构建消息：如果已有会话 messages，则直接追加；否则初始化 system + 首条 user。
         if self.messages:
             # 防御：历史可能没有 system，补一个
@@ -1005,7 +432,7 @@ class Agent:
                 mode_desc = _MODE_DESCRIPTIONS.get(self.mode, _MODE_DESCRIPTIONS["ide"])
                 system = SYSTEM_PROMPT.format(mode_description=mode_desc, workspace=self.config.workspace)
                 if bool(getattr(self.config, "memory_injection_enabled", True)):
-                    mem = memory_store.build_injection_text()
+                    mem = memory_store.build_injection_text(task_types=task_types, query=effective_prompt)
                     if mem.strip():
                         system += "\n\n## Local memory (auto)\n" + mem
                 self.messages.insert(0, {"role": "system", "content": system})
@@ -1014,11 +441,20 @@ class Agent:
             mode_desc = _MODE_DESCRIPTIONS.get(self.mode, _MODE_DESCRIPTIONS["ide"])
             system = SYSTEM_PROMPT.format(mode_description=mode_desc, workspace=self.config.workspace)
             if bool(getattr(self.config, "memory_injection_enabled", True)):
-                mem = memory_store.build_injection_text()
+                mem = memory_store.build_injection_text(task_types=task_types, query=effective_prompt)
                 if mem.strip():
                     system += "\n\n## Local memory (auto)\n" + mem
             self.messages = [{"role": "system", "content": system}]
             self.messages.append({"role": "user", "content": self._build_user_content(effective_prompt, attachments)})
+
+        # P3-5: Yield memory hit metadata for UI visualization
+        if bool(getattr(self.config, "memory_injection_enabled", True)):
+            try:
+                hits = memory_store.get_injection_hits(task_types=task_types, query=effective_prompt)
+                if any(hits.get(k, 0) > 0 for k in ("rules_count", "facts_count", "insights_count", "archives_count")):
+                    yield {"type": "memory_hits", "hits": hits}
+            except Exception:
+                pass
 
         # 记录初始 token
         self.ctx.record_prompt(self.messages)
@@ -1098,6 +534,36 @@ class Agent:
                 if bool(getattr(self.config, "skills_enabled", True)):
                     draft = self._build_skill_save_draft(full_text)
                     if draft:
+                        # 评分
+                        score_result = score_skill_draft(
+                            draft=draft,
+                            tool_calls=self._collected_tool_calls,
+                            tool_results=self._collected_tool_results,
+                            assistant_text=full_text,
+                            conversation_ended_normally=True,
+                        )
+                        draft["score"] = {
+                            "total": score_result.total,
+                            "completeness": score_result.completeness,
+                            "reusability": score_result.reusability,
+                            "success_signal": score_result.success_signal,
+                            "label": get_score_label(score_result.total),
+                            "worth_saving": is_worth_saving(score_result),
+                            "reasons": score_result.reasons,
+                        }
+                        # 自动入库策略
+                        threshold = float(getattr(self.config, "auto_save_skill_threshold", 75.0))
+                        if score_result.total >= threshold:
+                            # 自动保存
+                            saved = self.skill_manager.upsert_skill(
+                                name=draft.get("name", ""),
+                                intent_pattern=draft.get("intent_pattern", []),
+                                steps=draft.get("steps", []),
+                                execution_plan=draft.get("execution_plan", []),
+                            )
+                            draft["auto_saved"] = True
+                            draft["saved_id"] = saved.id
+                            yield {"type": "skill_auto_saved", "skill_id": saved.id, "score": score_result.total}
                         yield {"type": "skill_save_draft", "draft": draft}
                 yield {"type": "done", "text": full_text, "turns": turns, "context": self.ctx.summary()}
                 return
@@ -1121,8 +587,23 @@ class Agent:
                     yield {"type": "tool_result", "name": name, "result": f"Invalid JSON arguments: {tc['function']['arguments'][:200]}", "error": True}
                     continue
 
-                # IDE 模式：生成预览并确认（read_file/search 等只读操作不需确认）
-                if self.mode == "ide" and name in ("edit_file", "write_file"):
+                # IDE 模式：基于风险分级的审批策略
+                meta = TOOL_REGISTRY.get(name)
+                need_confirm = False
+                if self.mode == "ide" and meta:
+                    # SAFE 级（只读）→ 直接放行
+                    # LOW 级（文件写/编辑）→ 需要确认
+                    # MEDIUM 级（安全 Shell、网页）→ 放行
+                    # HIGH 级（未知 Shell）→ 需要确认
+                    # CRITICAL 级（危险 Shell）→ execute() 会自动拦截
+                    if meta.risk in (RiskLevel.LOW, RiskLevel.HIGH):
+                        need_confirm = True
+                    elif name == "run_shell":
+                        shell_risk = classify_shell_risk(args.get("command", ""))
+                        if shell_risk in (RiskLevel.HIGH, RiskLevel.CRITICAL):
+                            need_confirm = True
+
+                if need_confirm:
                     preview = self.tools.preview(name, args)
                     yield {"type": "confirm", "tool_call": tc, "preview": preview, "args": args}
                     approved = await self._wait_approval()
@@ -1132,11 +613,25 @@ class Agent:
                         continue
 
                 # 执行工具
-                yield {"type": "tool_call", "name": name, "arguments": args, "preview": self.tools.preview(name, args)}
+                risk_val = meta.risk.value if meta else "unknown"
+                if name == "run_shell":
+                    shell_risk = classify_shell_risk(args.get("command", ""))
+                    risk_val = shell_risk.value
+                yield {"type": "tool_call", "name": name, "arguments": args, "preview": self.tools.preview(name, args), "risk": risk_val}
                 result = self.tools.execute(name, args)
                 is_error = result.startswith("ToolError:") or result.startswith("Error:")
                 yield {"type": "tool_result", "name": name, "result": result, "error": is_error}
                 tool_results.append({"tool_call_id": tc["id"], "role": "tool", "content": result})
+                # 收集用于评分
+                self._collected_tool_calls.append({"name": name, "arguments": args})
+                self._collected_tool_results.append({"name": name, "result": result[:1000], "error": is_error})
+                # 录制执行计划用于 Skill 回放（只存关键摘要，不存完整输出）
+                self._recorded_execution_plan.append({
+                    "step": len(self._recorded_execution_plan) + 1,
+                    "tool": name,
+                    "args": args,
+                    "success": not is_error,
+                })
 
             # 添加工具结果消息（OpenAI 格式：逐个 tool 角色消息）
             for tr in tool_results:
@@ -1212,19 +707,51 @@ class Agent:
         skill = mr.best
         if not skill:
             return prompt
-        steps = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(skill.steps[:8])) or "1. Follow the best-known sequence."
         extra = ""
         if mr.is_ambiguous() and len(mr.candidates) > 1:
             names = [f"{sk.name} ({sk.id})" for _, sk in mr.candidates[1:4]]
             if names:
-                extra = "\n[Other close-matching skills — pick the best fit or ignore if irrelevant: " + "; ".join(names) + "]\n"
+                extra = "\n[其他高相似技能（按需选择，不相关可忽略）: " + "; ".join(names) + "]\n"
+        # 如果有录制的执行计划，注入回放指令
+        if skill.execution_plan:
+            plan_lines = []
+            for step in skill.execution_plan:
+                s = step.get("step", "?")
+                tool = step.get("tool", "")
+                args = step.get("args", {})
+                if tool == "run_shell":
+                    cmd = args.get("command", "")
+                    plan_lines.append(f"  {s}. run_shell(command={cmd!r})")
+                elif tool == "write_file":
+                    path = args.get("path", "")
+                    plan_lines.append(f"  {s}. write_file(path={path!r})")
+                elif tool == "edit_file":
+                    path = args.get("path", "")
+                    plan_lines.append(f"  {s}. edit_file(path={path!r})")
+                else:
+                    plan_lines.append(f"  {s}. {tool}({json.dumps(args, ensure_ascii=False)[:120]})")
+            plan_text = "\n".join(plan_lines)
+            return (
+                f"{prompt}\n\n"
+                "[已匹配本地技能 — 回放模式]\n"
+                f"- 技能: {skill.name}\n"
+                f"- ID: {skill.id}\n"
+                "- 指令: 以下是该技能上次成功执行的完整工具调用序列。请严格按照此序列执行，"
+                "参数可按当前上下文微调，但工具名和调用顺序不要改变。"
+                "如果某步失败，再自行规划替代方案。\n"
+                "[回放序列]\n"
+                f"{plan_text}\n"
+                f"{extra}"
+            )
+        # 无执行计划，走原有的文字提示模式
+        steps = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(skill.steps[:8])) or "1. 按已验证的最佳流程执行。"
         return (
             f"{prompt}\n\n"
-            "[Matched Local Skill]\n"
-            f"- Skill: {skill.name}\n"
+            "[已匹配本地技能]\n"
+            f"- 技能: {skill.name}\n"
             f"- ID: {skill.id}\n"
-            "- Guidance: Reuse this plan when it fits the current task. If constraints differ, adapt explicitly.\n"
-            "[Recommended Steps]\n"
+            "- 指引: 当前任务适配时优先复用该流程；若约束不同请明确调整。\n"
+            "[建议步骤]\n"
             f"{steps}\n"
             f"{extra}"
         )
@@ -1284,29 +811,105 @@ class Agent:
         tools_used = self._collect_tool_names_from_messages()
         title = prompt.replace("\n", " ").strip()[:48] or "Skill"
         steps: list[str] = []
-        for n in tools_used[:6]:
-            steps.append(f"Use tool `{n}` when appropriate for this task type.")
+        # 如果有录制的执行计划，基于实际步骤生成描述
+        if self._recorded_execution_plan:
+            for rec in self._recorded_execution_plan[:8]:
+                tool = rec.get("tool", "")
+                args = rec.get("args", {})
+                if tool == "run_shell":
+                    cmd = args.get("command", "")[:80]
+                    steps.append(f"执行命令: `{cmd}`")
+                elif tool == "write_file":
+                    path = args.get("path", "")
+                    steps.append(f"写入文件: `{path}`")
+                elif tool == "edit_file":
+                    path = args.get("path", "")
+                    steps.append(f"编辑文件: `{path}`")
+                elif tool == "read_file":
+                    path = args.get("path", "")
+                    steps.append(f"读取文件: `{path}`")
+                else:
+                    steps.append(f"调用工具 `{tool}`")
+        else:
+            for n in tools_used[:6]:
+                steps.append(f"在此类任务中，适合时可调用工具 `{n}`。")
         summ = (last_assistant_text or "").strip()
         if summ:
             first = summ.split("\n", 1)[0][:240]
-            steps.append(f"Summary hint: {first}")
+            steps.append(f"摘要提示: {first}")
         if not steps:
-            steps.append("Follow the assistant's last answer as the workflow baseline.")
-        return {
+            steps.append("以最近一次助手有效回答作为流程基线。")
+        draft = {
             "name": title,
             "intent_pattern": self._guess_keywords_from_prompt(prompt),
             "steps": steps[:10],
             "source_prompt": prompt[:4000],
         }
+        # 附带录制的执行计划
+        if self._recorded_execution_plan:
+            draft["execution_plan"] = self._recorded_execution_plan
+        return draft
 
     def _trim_conversation(self):
-        """裁剪消息历史，保留 system + 最近两轮完整对话。"""
+        """分层裁剪：保留近期高保真 + 历史摘要锚点。"""
         if len(self.messages) <= 8:
             return
-        # 保留：system (idx 0) + 最近 6 条消息（约 2 轮完整工具调用循环）
-        keep = max(6, min(14, len(self.messages) // 2))
-        old_count = len(self.messages) - keep - 1
-        self.messages = [self.messages[0]] + self.messages[-keep:]
+        system = self.messages[0]
+        body = self.messages[1:]
+
+        body_wo_anchor = []
+        for m in body:
+            if m.get("role") == "system" and str(m.get("content", "")).startswith("[Conversation Memory Anchor]"):
+                continue
+            body_wo_anchor.append(m)
+        body = body_wo_anchor
+        if len(body) <= 8:
+            self.messages = [system] + body
+            self.ctx.record_prompt(self.messages)
+            return 0
+
+        keep = max(6, min(14, len(body) // 2))
+        head = body[:-keep]
+        tail = body[-keep:]
+
+        def _msg_text(msg: dict) -> str:
+            c = msg.get("content", "")
+            if isinstance(c, str):
+                return c.strip()
+            if isinstance(c, list):
+                parts = []
+                for p in c:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        parts.append(str(p.get("text", "")).strip())
+                return " ".join([x for x in parts if x]).strip()
+            return str(c or "").strip()
+
+        rows = []
+        for m in head[-24:]:
+            role = str(m.get("role", ""))
+            if role not in ("user", "assistant", "tool"):
+                continue
+            txt = _msg_text(m)
+            if not txt:
+                continue
+            txt = txt.replace("\n", " ")
+            if len(txt) > 180:
+                txt = txt[:177] + "..."
+            rows.append(f"- {role}: {txt}")
+        anchor = ""
+        if rows:
+            anchor = (
+                "[会话记忆锚点]\n"
+                "以下为较早轮次的压缩摘要，用于保持连续性；若与最近轮次冲突，以最近轮次为准。\n"
+                "摘要:\n" + "\n".join(rows[-12:])
+            )
+
+        new_msgs = [system]
+        if anchor:
+            new_msgs.append({"role": "system", "content": anchor})
+        new_msgs.extend(tail)
+        old_count = len(self.messages) - len(new_msgs)
+        self.messages = new_msgs
         # 重新估算 token
         self.ctx.record_prompt(self.messages)
         return old_count

@@ -22,6 +22,9 @@ memory/**
 !memory/**/*.bat
 !memory/**/*.ps1
 logs/
+evidence/
+benchmarks/results/
+benchmarks/workspace/
 .venv/
 .idea/
 .vscode/
