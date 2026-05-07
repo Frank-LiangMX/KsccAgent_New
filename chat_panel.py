@@ -15,8 +15,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QFrame, QSizePolicy, QFileDialog, QMenu, QToolTip, QTextEdit,
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, pyqtSignal
-from PyQt6.QtGui import QFont, QFontMetrics, QPixmap
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, pyqtSignal, QRect
+from PyQt6.QtGui import QFont, QFontMetrics, QPixmap, QColor, QPainter, QLinearGradient
 
 from ui_common import (
     _is_light_theme, _with_tooltip_style, _make_plus_icon,
@@ -34,8 +34,6 @@ from chat_widgets import (
     ContextRingWidget,
 )
 
-STATUS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
 # ── 复杂任务检测 ─────────────────────────────────────────
 _TASK_STEP_MARKERS = [
     "然后", "接着", "之后", "最后", "并且", "同时",
@@ -46,6 +44,7 @@ _TASK_ACTION_VERBS = [
     "优化", "监控", "自动化", "批量", "定时", "备份", "同步", "集成",
     "create", "build", "deploy", "configure", "install", "setup", "migrate",
     "refactor", "optimize", "monitor", "automate", "batch", "backup", "sync",
+    "analyze", "investigate", "fix", "implement", "integrate", "test",
 ]
 
 
@@ -72,6 +71,10 @@ def _is_complex_task(text: str) -> bool:
     if ("并且" in t and "还" in t) or ("不仅" in t and "还要" in t):
         return True
     if ("not only" in t and "but also" in t) or ("and also" in t):
+        return True
+    short_multi = re.split(r"[，,。.;；]| and | then | 然后 | 并且 ", t)
+    short_multi = [seg.strip() for seg in short_multi if seg.strip()]
+    if len(t) <= 64 and len(short_multi) >= 3 and verb_hits >= 2:
         return True
     return False
 
@@ -134,10 +137,98 @@ class TaskSuggestionBar(QFrame):
         )
 
 
+class ComposerRunHalo(QWidget):
+    """Input card top-edge shimmer while agent is running."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = False
+        self._phase = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(14)
+        self._timer.timeout.connect(self._tick)
+        self._top = -2
+        self._height = 2
+        self._margin_x = 24
+        self._bar_w = 392.0
+        self._glow_pad = 36.0
+        self._x = 0.0
+        self._vx = 4.5
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.hide()
+
+    def set_running(self, running: bool):
+        running = bool(running)
+        if self._running == running:
+            return
+        self._running = running
+        if running:
+            self._phase = 0
+            self._x = 0.0
+            self._vx = abs(self._vx) if self._vx else 4.5
+            self.show()
+            self.raise_()
+            self._timer.start()
+            self.update()
+        else:
+            self._timer.stop()
+            self.hide()
+
+    def _tick(self):
+        self._phase = (self._phase + 1) % 2000
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._running:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        body = self.rect()
+        body.setLeft(body.left() + self._margin_x)
+        body.setRight(body.right() - self._margin_x)
+        body.setTop(max(0, self._top + 1))
+        body.setHeight(self._height)
+        if body.width() <= 0 or body.height() <= 0:
+            return
+        visual_w = self._bar_w + self._glow_pad * 2.0
+        max_x = max(0.0, float(body.width()) - visual_w)
+        self._x += self._vx
+        if self._x < 0.0:
+            self._x = -self._x
+            self._vx = abs(self._vx)
+        elif self._x > max_x:
+            self._x = max_x - (self._x - max_x)
+            self._vx = -abs(self._vx)
+        bar_w = int(min(self._bar_w, max(1.0, float(body.width()))))
+        left = int(round(body.left() + self._glow_pad + self._x))
+        top = body.top()
+        bar_rect = QRect(left, top, bar_w, body.height())
+        if bar_rect.width() <= 1:
+            return
+        # Keep the middle clearly stronger than the sides, but soften the
+        # center plateau and extend the side falloff for a gentler ribbon.
+        g = QLinearGradient(bar_rect.left(), bar_rect.top(), bar_rect.right(), bar_rect.top())
+        g.setColorAt(0.00, QColor(59, 130, 246, 0))
+        g.setColorAt(0.04, QColor(59, 130, 246, 8))
+        g.setColorAt(0.14, QColor(59, 130, 246, 18))
+        g.setColorAt(0.26, QColor(59, 130, 246, 42))
+        g.setColorAt(0.38, QColor(59, 130, 246, 78))
+        g.setColorAt(0.46, QColor(59, 130, 246, 104))
+        g.setColorAt(0.50, QColor(59, 130, 246, 120))
+        g.setColorAt(0.54, QColor(59, 130, 246, 104))
+        g.setColorAt(0.62, QColor(59, 130, 246, 78))
+        g.setColorAt(0.74, QColor(59, 130, 246, 42))
+        g.setColorAt(0.86, QColor(59, 130, 246, 18))
+        g.setColorAt(0.96, QColor(59, 130, 246, 8))
+        g.setColorAt(1.00, QColor(59, 130, 246, 0))
+        p.fillRect(bar_rect, g)
+
+
 class ChatPanel(QWidget):
     send_message = pyqtSignal(str, object)
     add_skill_requested = pyqtSignal()
     task_suggestion_accepted = pyqtSignal(str, object)  # (text, attachments)
+    task_mode_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -147,6 +238,7 @@ class ChatPanel(QWidget):
         self._empty_mode = False
         self._bulk_restore = False
         self._task_mode_enabled = False
+        self._mode_switch_locked = False
         l = QVBoxLayout(self)
         self._root_layout = l
         l.setContentsMargins(0, 0, 0, 0)
@@ -207,14 +299,16 @@ class ChatPanel(QWidget):
         self._model_name = ""
 
         self.mode_menu_btn = QPushButton("")
-        self.mode_menu_btn.setFixedHeight(28)
-        self.mode_menu_btn.setMinimumWidth(156)
+        self.mode_menu_btn.setFixedHeight(26)
+        self.mode_menu_btn.setMinimumWidth(78)
+        self.mode_menu_btn.setMaximumWidth(220)
         self.mode_menu_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.mode_menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mode_menu_btn.clicked.connect(self._show_runtime_menu)
 
         self._input_card = QFrame()
         self._input_card.setObjectName("inputGlassCard")
+        self._run_halo = ComposerRunHalo(self._input_card)
         vl = QVBoxLayout(self._input_card)
         vl.setContentsMargins(10, 8, 10, 8)
         vl.setSpacing(4)
@@ -253,6 +347,22 @@ class ChatPanel(QWidget):
         self._plus_btn.setToolTip("添加附件")
         self._plus_btn.clicked.connect(self._pick_attachments)
 
+        self.task_mode_btn = QPushButton("")
+        self.task_mode_btn.setCheckable(True)
+        self.task_mode_btn.setChecked(False)
+        self.task_mode_btn.setFixedHeight(26)
+        self.task_mode_btn.setFixedWidth(26)
+        self.task_mode_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.task_mode_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.task_mode_btn.setToolTip("Task 模式：开启后强制按计划执行")
+        self.task_mode_btn.toggled.connect(self._on_task_mode_btn_toggled)
+
+        self._context_ring_slot = QWidget()
+        self._context_ring_slot.setFixedWidth(24)
+        crl = QHBoxLayout(self._context_ring_slot)
+        crl.setContentsMargins(2, 0, 2, 0)
+        crl.setSpacing(0)
+
         self.send_btn = QPushButton("↑")
         self.send_btn.setFixedSize(28, 28)
         self.send_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -277,14 +387,20 @@ class ChatPanel(QWidget):
         )
         self.stop_btn.setToolTip("停止")
         self.stop_btn.hide()
+        # Immediate local stop: avoid lingering run halo if upper-layer stop handling lags.
+        self.stop_btn.clicked.connect(self.end_stream)
+        self.stop_btn.clicked.connect(lambda: self.set_kscc_status(""))
 
         toolbar.addWidget(self._plus_btn)
         toolbar.addStretch(1)
+        toolbar.addWidget(self.task_mode_btn)
+        toolbar.addWidget(self._context_ring_slot)
         toolbar.addWidget(self.mode_menu_btn)
         toolbar.addWidget(self.send_btn)
         toolbar.addWidget(self.stop_btn)
 
         self._refresh_mode_menu_btn_text()
+        self._update_task_button_icon()
 
         vl.addWidget(self.attachments_row)
         vl.addWidget(self.input_edit)
@@ -398,13 +514,24 @@ class ChatPanel(QWidget):
             _with_tooltip_style(
                 "QPushButton {"
                 f"  background:transparent; color:{menu_fg}; border:none;"
-                "  border-radius:8px; padding:2px 8px; font-size:12px;"
+                "  border-radius:8px; padding:1px 6px; font-size:11px;"
                 "  text-align:center;"
                 f"  font-family:{_CODE_FONT_STACK};"
                 "}"
                 f"QPushButton:hover {{ background:{menu_bg_h}; color:{menu_fg_h}; }}"
             )
         )
+        task_icon = "#9aa4b2" if not self._task_mode_enabled else ("#2563eb" if light else "#5ee9ff")
+        self.task_mode_btn.setStyleSheet(
+            _with_tooltip_style(
+                "QPushButton{background:transparent;border:none;border-radius:8px;padding:0px;}"
+                "QPushButton:hover{background:rgba(148,163,184,0.10);border:none;}"
+                "QPushButton:checked{background:transparent;border:none;}"
+                f"QPushButton:disabled{{color:{menu_fg};}}"
+            )
+        )
+        self.task_mode_btn.setIcon(quark_icon("spark", 14, task_icon))
+        self.task_mode_btn.setIconSize(QSize(14, 14))
         self._plus_btn.setIcon(_make_plus_icon(size=14, color=plus_icon))
         self._plus_btn.setStyleSheet(
             _with_tooltip_style(
@@ -578,9 +705,50 @@ class ChatPanel(QWidget):
         model = self._model_name or "—"
         model_display = model.split("/", 1)[1].strip() if "/" in model else model
         abbrev = "OA" if self._backend_key == "OpenAI" else "KS"
-        short = model_display if len(model_display) <= 28 else model_display[:25] + "…"
-        self.mode_menu_btn.setText(f"[{abbrev}] {short}  ▾")
+        short = model_display if len(model_display) <= 18 else model_display[:15] + "…"
+        label = f"[{abbrev}] {short}  ▾"
+        self.mode_menu_btn.setText(label)
+        fm = self.mode_menu_btn.fontMetrics()
+        content_w = fm.horizontalAdvance(label) + 18
+        target_w = max(78, min(220, content_w))
+        self.mode_menu_btn.setFixedWidth(target_w)
         self.mode_menu_btn.setToolTip(f"后端: {self._backend_key}\n模型: {model}")
+
+    def _update_task_button_icon(self):
+        light = _is_light_theme()
+        color = "#9aa4b2"
+        if self._task_mode_enabled:
+            color = "#2563eb" if light else "#5ee9ff"
+        self.task_mode_btn.setIcon(quark_icon("spark", 14, color))
+        self.task_mode_btn.setIconSize(QSize(14, 14))
+
+    def _on_task_mode_btn_toggled(self, checked: bool):
+        if self._mode_switch_locked:
+            self.task_mode_btn.blockSignals(True)
+            self.task_mode_btn.setChecked(self._task_mode_enabled)
+            self.task_mode_btn.blockSignals(False)
+            return
+        self.set_task_mode_enabled(bool(checked))
+        self.task_mode_changed.emit(self._task_mode_enabled)
+
+    def set_task_mode_enabled(self, enabled: bool):
+        self._task_mode_enabled = bool(enabled)
+        if self.task_mode_btn.isChecked() != self._task_mode_enabled:
+            self.task_mode_btn.blockSignals(True)
+            self.task_mode_btn.setChecked(self._task_mode_enabled)
+            self.task_mode_btn.blockSignals(False)
+        self._update_task_button_icon()
+
+    def set_mode_switch_locked(self, locked: bool):
+        self._mode_switch_locked = bool(locked)
+        self.mode_menu_btn.setEnabled(not locked)
+        self.task_mode_btn.setEnabled(not locked)
+        if locked:
+            self.mode_menu_btn.setToolTip("运行中，暂不可切换模型")
+            self.task_mode_btn.setToolTip("运行中，暂不可切换 Task 模式")
+        else:
+            self._refresh_mode_menu_btn_text()
+            self.task_mode_btn.setToolTip("Task 模式：开启后强制按计划执行")
 
     def _pick_backend(self, backend: str):
         if self._backend_key == backend:
@@ -595,6 +763,8 @@ class ChatPanel(QWidget):
         self._refresh_mode_menu_btn_text()
 
     def _show_runtime_menu(self):
+        if self._mode_switch_locked:
+            return
         menu = QMenu(self)
         light = _is_light_theme()
         polish_menu(menu, "light" if light else "dark", font_size=12)
@@ -640,6 +810,17 @@ class ChatPanel(QWidget):
         self._model_name = model
         self._refresh_mode_menu_btn_text()
 
+    def set_context_ring_widget(self, widget: QWidget):
+        if widget is None:
+            return
+        layout = self._context_ring_slot.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+        layout.addWidget(widget, 0, Qt.AlignmentFlag.AlignCenter)
+
     def current_backend_label(self) -> str:
         return self._backend_key
 
@@ -679,9 +860,8 @@ class ChatPanel(QWidget):
         )
 
     def _render_status(self):
-        frame = STATUS_FRAMES[self._status_phase % len(STATUS_FRAMES)] if STATUS_FRAMES else ""
-        prefix = f"{frame} " if frame else ""
-        self.kscc_status_lbl.setText(prefix + self._status_base_text)
+        dots = "." * ((self._status_phase % 3) + 1)
+        self.kscc_status_lbl.setText(f"{self._status_base_text}{dots}")
 
     def _tick_status(self):
         if not self._status_base_text:
@@ -823,6 +1003,9 @@ class ChatPanel(QWidget):
         self.send_btn.setEnabled(False)
         self.send_btn.hide()
         self.stop_btn.show()
+        self._run_halo.setGeometry(self._input_card.rect())
+        self._run_halo.raise_()
+        self._run_halo.set_running(True)
 
     def append_stream(self, text: str):
         if not text or not self._stream_bubble:
@@ -843,6 +1026,7 @@ class ChatPanel(QWidget):
         self.send_btn.setEnabled(True)
         self.send_btn.show()
         self.stop_btn.hide()
+        self._run_halo.set_running(False)
 
     def add_tool(self, name, preview):
         if self._stream_bubble and name not in ("edit_file", "Write", "Edit"):
@@ -1048,3 +1232,11 @@ class ChatPanel(QWidget):
     def _scroll(self):
         sb = self.scroll.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self._run_halo.setGeometry(self._input_card.rect())
+            self._run_halo.raise_()
+        except Exception:
+            pass

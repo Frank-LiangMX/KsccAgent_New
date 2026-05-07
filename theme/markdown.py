@@ -271,13 +271,22 @@ def md_chat_to_html(text: str, light: bool = False) -> str:
     # --- bold / italic ---
     t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
     t = re.sub(r"\*(.+?)\*", r"<i>\1</i>", t)
-    t = re.sub(r"^### (.+)$", r'<h4 style="margin:4px 0">\1</h4>', t, flags=re.MULTILINE)
-    t = re.sub(r"^## (.+)$", r'<h3 style="margin:4px 0">\1</h3>', t, flags=re.MULTILINE)
-    t = re.sub(r"^# (.+)$", r'<h2 style="margin:4px 0">\1</h2>', t, flags=re.MULTILINE)
+    heading_color = "#111827" if light else "#d5dee8"
+    t = re.sub(r"^### (.+)$", rf'<h4 style="margin:3px 0;color:{heading_color};font-weight:600">\1</h4>', t, flags=re.MULTILINE)
+    t = re.sub(r"^## (.+)$", rf'<h3 style="margin:3px 0;color:{heading_color};font-weight:600">\1</h3>', t, flags=re.MULTILINE)
+    t = re.sub(r"^# (.+)$", rf'<h2 style="margin:3px 0;color:{heading_color};font-weight:600">\1</h2>', t, flags=re.MULTILINE)
     t = re.sub(r"^- (.+)$", r"<li>\1</li>", t, flags=re.MULTILINE)
-    t = re.sub(r"(<li>.*?</li>\n?)+", r"<ul>\g<0></ul>", t, flags=re.DOTALL)
+    t = re.sub(
+        r"(<li>.*?</li>\n?)+",
+        r"<ul style='margin:2px 0 2px 14px;padding:0;line-height:1.35'>\g<0></ul>",
+        t,
+        flags=re.DOTALL,
+    )
+    t = re.sub(r"<li>", "<li style='margin:0;padding:0;line-height:1.35'>", t)
     t = re.sub(r"\n{2,}", "\n", t)
     t = t.replace("\n", "<br>")
+    t = re.sub(r"<br>\s*<ul", "<ul", t)
+    t = re.sub(r"</ul>\s*<br>", "</ul>", t)
     t = re.sub(r"(?:<br>\s*){2,}", "<br>", t)
     for key, html in code_blocks.items():
         t = t.replace(key, html)

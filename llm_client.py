@@ -47,6 +47,7 @@ class OpenAIBackend:
                     yield {"type": "error", "content": f"API Error {resp.status_code}: {text.decode()[:500]}"}
                     return
                 tool_calls: dict[int, dict] = {}
+                finish_reason = None
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -60,7 +61,9 @@ class OpenAIBackend:
                     usage = chunk.get("usage")
                     if usage:
                         yield {"type": "usage", "input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)}
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    choice = chunk.get("choices", [{}])[0]
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    delta = choice.get("delta", {})
                     if "reasoning_content" in delta and delta["reasoning_content"]:
                         yield {"type": "thinking", "text": delta["reasoning_content"]}
                     if "content" in delta and delta["content"]:
@@ -78,8 +81,15 @@ class OpenAIBackend:
                             if "arguments" in tc["function"]:
                                 tc_obj["function"]["arguments"] += tc["function"]["arguments"]
                         yield {"type": "tool_delta", "index": idx, "name": tc_obj["function"]["name"], "arguments": tc_obj["function"]["arguments"]}
-                for tc in tool_calls.values():
-                    yield {"type": "tool_call_complete", "tool_call": tc}
+                if finish_reason == "tool_calls":
+                    for tc in tool_calls.values():
+                        fn = tc.get("function", {})
+                        if not fn.get("name", "").strip():
+                            continue
+                        args = fn.get("arguments", "")
+                        if not str(args).strip():
+                            continue
+                        yield {"type": "tool_call_complete", "tool_call": tc}
 
 
 class AnthropicBackend:

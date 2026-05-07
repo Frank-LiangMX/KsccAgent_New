@@ -523,8 +523,16 @@ class Agent:
         self._collected_tool_calls = []  # 收集工具调用用于评分
         self._collected_tool_results = []  # 收集工具结果用于评分
         self._recorded_execution_plan = []  # 录制工具调用链用于 Skill 回放
+        # 新会话前 N 条消息不注入跨会话记忆（计数器递减，降到 0 后启用）
+        _msg_count = getattr(self.config, "_new_session_msg_count", 0)
+        disable_memory = _msg_count > 0
+        if _msg_count > 0:
+            self.config._new_session_msg_count = _msg_count - 1
+        disable_skill_once = bool(getattr(self.config, "_disable_skill_match_once", False))
+        if disable_skill_once:
+            self.config._disable_skill_match_once = False
         dbg = bool(getattr(self.config, "skill_debug_log", False))
-        skills_on = bool(getattr(self.config, "skills_enabled", True))
+        skills_on = bool(getattr(self.config, "skills_enabled", True)) and (not disable_skill_once)
 
         if not skills_on:
             self._active_skill = None
@@ -584,7 +592,7 @@ class Agent:
                 system = SYSTEM_PROMPT.format(mode_description=mode_desc, workspace=self.config.workspace)
                 if bool(getattr(self.config, "feature_browser_tools", False)):
                     system += _BROWSER_TOOL_GUIDANCE
-                if bool(getattr(self.config, "memory_injection_enabled", True)):
+                if bool(getattr(self.config, "memory_injection_enabled", True)) and (not disable_memory):
                     mem = memory_store.build_injection_text(task_types=task_types, query=effective_prompt, exclude_session_ids=getattr(self.config, "_exclude_session_ids", None))
                     if mem.strip():
                         system += "\n\n## Local memory (auto)\n" + mem
@@ -597,7 +605,7 @@ class Agent:
             system = SYSTEM_PROMPT.format(mode_description=mode_desc, workspace=self.config.workspace)
             if bool(getattr(self.config, "feature_browser_tools", False)):
                 system += _BROWSER_TOOL_GUIDANCE
-            if bool(getattr(self.config, "memory_injection_enabled", True)):
+            if bool(getattr(self.config, "memory_injection_enabled", True)) and (not disable_memory):
                 mem = memory_store.build_injection_text(task_types=task_types, query=effective_prompt, exclude_session_ids=getattr(self.config, "_exclude_session_ids", None))
                 if mem.strip():
                     system += "\n\n## Local memory (auto)\n" + mem
@@ -605,7 +613,7 @@ class Agent:
             self.messages.append({"role": "user", "content": self._build_user_content(effective_prompt, attachments)})
 
         # P3-5: Yield memory hit metadata for UI visualization
-        if bool(getattr(self.config, "memory_injection_enabled", True)):
+        if bool(getattr(self.config, "memory_injection_enabled", True)) and (not disable_memory):
             try:
                 hits = memory_store.get_injection_hits(task_types=task_types, query=effective_prompt, exclude_session_ids=getattr(self.config, "_exclude_session_ids", None))
                 if any(hits.get(k, 0) > 0 for k in ("rules_count", "facts_count", "insights_count", "archives_count")):
@@ -842,7 +850,12 @@ class Agent:
                 except Exception:
                     pass
             elif mime and mime.startswith("image/"):
-                text_parts.append(f"[Attached image: {Path(fpath).name}]")
+                abs_img = str(Path(fpath).resolve())
+                text_parts.append(
+                    f"[Attached image: {Path(fpath).name}]\n"
+                    f"- absolute_path: {abs_img}\n"
+                    "- note: 当前模型不支持原生视觉输入；如需识图请调用 visual_analysis 或 OCR 工具。"
+                )
             else:
                 try:
                     content = Path(fpath).read_text("utf-8", errors="replace")

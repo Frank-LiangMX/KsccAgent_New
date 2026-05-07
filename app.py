@@ -62,7 +62,7 @@ from file_tree import FileTree
 from settings_page import SettingsPage
 from metrics_panel import MetricsPanel
 from audit_panel import AuditPanel
-from agent_worker import AgentWorker, TaskWorker, ClassifyWorker
+from agent_worker import AgentWorker, TaskWorker
 
 from agent import Agent
 from task_executor import TaskExecutor
@@ -139,9 +139,7 @@ class MainWindow(QMainWindow):
         self._pending_user_message_meta: Optional[dict] = None
         self._pending_skill_draft: Optional[dict] = None
         self._last_agent_prompt: str = ""
-        self._classify_worker: Optional[QThread] = None
-        self._pending_send: Optional[dict] = None  # 分类期间暂存 prompt/attachments
-        self._auto_task: bool = False  # 自动分类结果：当前消息使用 task 模式
+        self._auto_task: bool = False
         ip = Path(__file__).parent / "icon.png"
         if ip.exists():
             self.setWindowIcon(QIcon(str(ip)))
@@ -285,18 +283,6 @@ class MainWindow(QMainWindow):
                 )
             )
             self.mode_btn.setToolTip("切换 Solo / IDE 模式")
-        if hasattr(self, "_task_mode_btn"):
-            self._task_mode_btn.setStyleSheet(
-                _with_tooltip_style(
-                    f"QPushButton{{background:transparent;border:none;color:{dim};border-radius:10px;font-size:11px;font-weight:600;padding:0 12px;text-align:center;}}"
-                    f"QPushButton::icon{{padding-left:2px;}}"
-                    f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}"
-                    f"QPushButton:checked{{background:{accent_sel};color:{accent}}}"
-                    f"QPushButton:checked:hover{{background:{accent_sel};color:{accent}}}",
-                    light,
-                )
-            )
-            self._task_mode_btn.setToolTip("切换任务状态机模式 (Plan→Execute→Reflect)")
         _tss = (
             f"QPushButton{{background:transparent;border:none;color:{dim};border-radius:8px;padding:4px 6px}}"
             f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}"
@@ -317,7 +303,7 @@ class MainWindow(QMainWindow):
                 )
             )
         if hasattr(self, "model_lbl"):
-            self.model_lbl.setStyleSheet(f"color:{teal};font-weight:500;font-size:11px;background:transparent")
+            self.model_lbl.setVisible(False)
         if hasattr(self, "ws_lbl"):
             self.ws_lbl.setStyleSheet(f"color:{dim};font-size:11px;background:transparent;max-width:220px")
         if hasattr(self, "settings_btn"):
@@ -372,7 +358,7 @@ class MainWindow(QMainWindow):
                     )
                 )
         in_settings = hasattr(self, "content_stack") and self.content_stack.currentIndex() == 1
-        for name in ("mode_btn", "_file_tree_toggle", "_session_toggle", "ctx_ring", "model_lbl", "ws_btn", "ws_lbl", "_toolbar_spacer"):
+        for name in ("mode_btn", "_file_tree_toggle", "_session_toggle", "ws_btn", "ws_lbl", "_toolbar_spacer"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setVisible(not in_settings)
@@ -434,15 +420,6 @@ class MainWindow(QMainWindow):
         self.mode_btn.setIconSize(QSize(16, 16))
         self.mode_btn.toggled.connect(self._on_mode_toggle)
         tb.addWidget(self.mode_btn)
-        self._task_mode_btn = QPushButton("Task")
-        self._task_mode_btn.setCheckable(True)
-        self._task_mode_btn.setChecked(False)
-        self._task_mode_btn.setFixedHeight(32)
-        self._task_mode_btn.setIcon(quark_icon("spark", 16))
-        self._task_mode_btn.setIconSize(QSize(16, 16))
-        self._task_mode_btn.setToolTip("切换任务状态机模式 (Plan→Execute→Reflect)")
-        self._task_mode_btn.toggled.connect(self._on_task_mode_toggle)
-        tb.addWidget(self._task_mode_btn)
         self._file_tree_toggle = QPushButton()
         self._file_tree_toggle.setCheckable(True)
         self._file_tree_toggle.setFixedSize(34, 34)
@@ -462,10 +439,9 @@ class MainWindow(QMainWindow):
         self._session_toggle.toggled.connect(self._on_session_panel_toggled)
         tb.addWidget(self._session_toggle)
         self.ctx_ring = ContextRingWidget(diameter=16)
-        tb.addWidget(self.ctx_ring)
         p = get_active_provider(self.config)
         self.model_lbl = QLabel(f"Kscc/{self.config.kscc_model}" if self.config.backend == "kscc" else f"OpenAI/{p.model}")
-        tb.addWidget(self.model_lbl)
+        self.model_lbl.hide()
         self._toolbar_spacer = QWidget()
         self._toolbar_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(self._toolbar_spacer)
@@ -596,7 +572,9 @@ class MainWindow(QMainWindow):
         self.chat.send_message.connect(self._on_send)
         self.chat.add_skill_requested.connect(self._open_skill_save_dialog)
         self.chat.task_suggestion_accepted.connect(self._on_task_suggestion_accepted)
+        self.chat.task_mode_changed.connect(self._on_chat_task_mode_changed)
         self.chat.stop_btn.clicked.connect(self._on_stop)
+        self.chat.set_context_ring_widget(self.ctx_ring)
         self._init_chat_selectors()
 
         self.session_chat_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -855,13 +833,14 @@ class MainWindow(QMainWindow):
         self.config.mode = "solo" if checked else "ide"
         QTimer.singleShot(0, self._sync_file_tree_toolbar_visibility)
 
-    def _on_task_mode_toggle(self, checked):
+    def _set_task_mode_enabled(self, checked: bool):
+        checked = bool(checked)
         if checked and not getattr(self.config, 'feature_task_mode', True):
-            self._task_mode_btn.setChecked(False)
+            self.chat.set_task_mode_enabled(False)
             self.slbl.setText("Task mode disabled. Enable in Settings > Agent > 实验特性")
             return
         self._task_mode = checked
-        self.chat._task_mode_enabled = checked
+        self.chat.set_task_mode_enabled(checked)
         if checked:
             self.task_panel.show()
         else:
@@ -877,9 +856,12 @@ class MainWindow(QMainWindow):
         else:
             QTimer.singleShot(100, self._redistribute_outer_splitter)
 
+    def _on_chat_task_mode_changed(self, enabled: bool):
+        self._set_task_mode_enabled(enabled)
+
     def _on_task_suggestion_accepted(self, text, attachments):
         """用户在建议条中点击"开启 Task 模式"。"""
-        self._task_mode_btn.setChecked(True)
+        self._set_task_mode_enabled(True)
         self.chat.set_empty_state(False)
         self.chat.add_message("user", text, attachments=attachments)
         self.chat.input_edit.clear()
@@ -1096,6 +1078,11 @@ class MainWindow(QMainWindow):
         mode = self.config.mode
         session = self.store.create(title="", workspace=target_ws or home, mode=mode)
         self._load_session(session.id)
+        # 新空会话的前几条消息不注入跨会话记忆，避免一上来"翻旧账"。
+        # _new_session_msg_count 递减，降到 0 后才启用记忆注入。
+        self.config._new_session_msg_count = 3
+        # 新空会话首条也禁用 skill 回放匹配，避免误命中旧任务 SOP。
+        self.config._disable_skill_match_once = True
 
     def _message_display_text(self, msg: dict) -> str:
         if msg.get("display_text") is not None:
@@ -1108,6 +1095,19 @@ class MainWindow(QMainWindow):
                 if isinstance(part, dict) and part.get("type") == "text":
                     return Agent.strip_skill_augmentation(str(part.get("text", "")))
         return Agent.strip_skill_augmentation(str(content or ""))
+
+    @staticmethod
+    def _is_task_internal_prompt_message(msg: dict) -> bool:
+        if not isinstance(msg, dict):
+            return False
+        if msg.get("role") != "user":
+            return False
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text = "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+        else:
+            text = str(content or "")
+        return ("请为以下任务制定执行计划：" in text) or ("请执行以下任务：" in text)
 
     def _on_sess_click(self, event, sid):
         if event.button() != Qt.MouseButton.LeftButton:
@@ -1200,6 +1200,10 @@ class MainWindow(QMainWindow):
         session = self.store.load(sid)
         if not session:
             return
+        # 只有当会话已有消息时才重置禁用标志，新空会话保持禁用状态
+        if session.messages:
+            self.config._new_session_msg_count = 0
+            self.config._disable_skill_match_once = False
         self.config._exclude_session_ids = []
         self._cur_session = session
         # Restore per-session state
@@ -1222,7 +1226,7 @@ class MainWindow(QMainWindow):
         try:
             for m in source_messages:
                 # Skip internal task executor messages (planning prompts, execution prompts)
-                if m.get("_internal"):
+                if m.get("_internal") or self._is_task_internal_prompt_message(m):
                     continue
                 r = m.get("role", "")
                 c = m.get("content", "")
@@ -1252,9 +1256,11 @@ class MainWindow(QMainWindow):
                 model_label = f"{session.backend}/{session.model}"
             self.chat.start_stream(model_label=model_label)
             self.chat.send_btn.setEnabled(False)
+            self.chat.set_mode_switch_locked(True)
         else:
             # Restore send/stop button state for non-running sessions
             self.chat.end_stream()
+            self.chat.set_mode_switch_locked(False)
         if session.workspace and os.path.isdir(session.workspace):
             self.config.workspace = os.path.abspath(session.workspace)
             self.ws_lbl.setText(self._ws_display(self.config.workspace))
@@ -1314,6 +1320,11 @@ class MainWindow(QMainWindow):
             self.config._exclude_session_ids = [self._cur_session.id]
         else:
             self.config._exclude_session_ids = []
+        # 新空会话的前几条消息不注入跨会话记忆，避免一上来”翻旧账”。
+        # _new_session_msg_count 递减，降到 0 后才启用记忆注入。
+        self.config._new_session_msg_count = 3
+        # 新空会话首条也禁用 skill 回放匹配，避免误命中旧任务 SOP。
+        self.config._disable_skill_match_once = True
         self._cur_session = None
         self._agent = None
         self._worker = None
@@ -1345,43 +1356,10 @@ class MainWindow(QMainWindow):
         sid = self._cur_session.id if self._cur_session else None
         if sid and self._session_is_running(sid):
             return
-        # 分类进行中，忽略重复发送
-        if self._classify_worker and self._classify_worker.isRunning():
-            return
-        # 如果用户已手动开启 task mode，直接走 task 流程
-        if self._task_mode:
-            self._start_agent(text, attachments or [])
-            return
-        # 自动分类：判断是否需要 plan 模式
         prompt_str = str(text or "").strip()
         if not prompt_str and not attachments:
             return
-        self._pending_send = {"prompt": text, "attachments": attachments or []}
-        self._running = True
-        self.chat.send_btn.setEnabled(False)
-        self.slbl.setText("分析任务复杂度...")
-        cw = ClassifyWorker(self.config, prompt_str or "请查看附件。")
-        cw.finished.connect(self._on_classify_done)
-        self._classify_worker = cw
-        cw.start()
-
-    def _on_classify_done(self, is_complex: bool):
-        self._classify_worker = None
-        pending = self._pending_send
-        self._pending_send = None
-        if not pending:
-            self._running = False
-            self.chat.send_btn.setEnabled(True)
-            return
-        # 如果用户在分类期间切换到了一个正在运行的会话，取消
-        sid = self._cur_session.id if self._cur_session else None
-        if sid and self._session_is_running(sid):
-            self._running = False
-            self.chat.send_btn.setEnabled(True)
-            return
-        # 自动分类结果：complex 时为当前消息启用 task，不影响全局 _task_mode
-        self._auto_task = is_complex
-        self._start_agent(pending["prompt"], pending["attachments"])
+        self._start_agent(text, attachments or [])
 
     def _start_agent(self, prompt, attachments_meta=None):
         self._running = True
@@ -1454,6 +1432,7 @@ class MainWindow(QMainWindow):
 
         self.chat.send_btn.setEnabled(False)
         self.chat.start_stream(model_label=f"{backend}/{model}")
+        self.chat.set_mode_switch_locked(True)
         self.slbl.setText("执行中...")
         # Dispose previous agent for this session if any
         prev_agent = self._agents.pop(sid, None)
@@ -1471,6 +1450,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.chat.add_error(f"Failed: {e}")
             self.chat.send_btn.setEnabled(True)
+            self.chat.set_mode_switch_locked(False)
             self._running = False
             return
         self._agent = agent
@@ -1485,10 +1465,7 @@ class MainWindow(QMainWindow):
             if not self._task_mode:
                 self.task_panel.show()
                 QTimer.singleShot(0, self._ensure_task_panel_default_width)
-                # 设置按钮 checked 样式（不触发 _on_task_mode_toggle）
-                self._task_mode_btn.blockSignals(True)
-                self._task_mode_btn.setChecked(True)
-                self._task_mode_btn.blockSignals(False)
+                self.chat.set_task_mode_enabled(True)
             _ws = self.config.workspace or os.path.dirname(os.path.abspath(__file__))
             task_exec = TaskExecutor(agent, config=self.config, log_dir=os.path.join(_ws, "logs", "tasks"))
             self._last_task_executor = task_exec
@@ -1580,6 +1557,7 @@ class MainWindow(QMainWindow):
         if is_current:
             self.chat.end_stream()
             self.chat.set_kscc_status("")
+            self.chat.set_mode_switch_locked(False)
             self.slbl.setText(f"Done - {turns} turns")
             try:
                 c = json.loads(cj)
@@ -1594,7 +1572,10 @@ class MainWindow(QMainWindow):
             session = self.store.load(sid)
         if session and agent and agent.messages:
             # Filter out internal task executor messages before saving
-            session.messages = [m for m in agent.messages if not m.get("_internal")]
+            session.messages = [
+                m for m in agent.messages
+                if (not m.get("_internal")) and (not self._is_task_internal_prompt_message(m))
+            ]
             # Strip skill augmentation from user messages for clean display on reload
             for msg in session.messages:
                 if msg.get("role") == "user":
@@ -1734,9 +1715,7 @@ class MainWindow(QMainWindow):
         self._resume_btn_hide()
         # 自动 task 结束，恢复按钮状态
         if not self._task_mode:
-            self._task_mode_btn.blockSignals(True)
-            self._task_mode_btn.setChecked(False)
-            self._task_mode_btn.blockSignals(False)
+            self.chat.set_task_mode_enabled(False)
         # 标记所有步骤为完成
         task_exec = self._task_executors.get(self._cur_session.id if self._cur_session else None)
         if task_exec:
@@ -1754,9 +1733,7 @@ class MainWindow(QMainWindow):
             self.slbl.setText(f"Task {task_id}: Failed - {error[:80]}")
             # 自动 task 失败，恢复按钮状态
             if not self._task_mode:
-                self._task_mode_btn.blockSignals(True)
-                self._task_mode_btn.setChecked(False)
-                self._task_mode_btn.blockSignals(False)
+                self.chat.set_task_mode_enabled(False)
             # 显示恢复按钮
             task_exec = self._task_executors.get(sid) or self._last_task_executor
             if task_exec:
@@ -1809,12 +1786,6 @@ class MainWindow(QMainWindow):
         self.task_panel._resumable_state = None
 
     def _on_stop(self):
-        # 停止分类线程（如果正在分类）
-        if self._classify_worker and self._classify_worker.isRunning():
-            self._classify_worker.terminate()
-            self._classify_worker.wait(2000)
-            self._classify_worker = None
-            self._pending_send = None
         sid = self._cur_session.id if self._cur_session else None
         if sid and sid in self._workers:
             w = self._workers[sid]
@@ -1831,6 +1802,7 @@ class MainWindow(QMainWindow):
         self._running = False
         self._worker = None
         self.chat.end_stream()
+        self.chat.set_mode_switch_locked(False)
         self._refresh_sessions()
         self.slbl.setText("Stopped")
 
@@ -1844,6 +1816,7 @@ class MainWindow(QMainWindow):
         if is_current:
             self.chat.add_error(t)
             self.chat.end_stream()
+            self.chat.set_mode_switch_locked(False)
             self.slbl.setText("Error")
             self._running = False
             self._refresh_sessions()
@@ -1948,6 +1921,7 @@ class MainWindow(QMainWindow):
             self._ctx_bind_sid = None
             self.chat.send_btn.setEnabled(True)
             self.chat.end_stream()
+            self.chat.set_mode_switch_locked(False)
             self._worker = None
             self._running = False
         # Clean up per-session state (_on_done fires before _on_fin, so agent is safe to pop)
@@ -1980,7 +1954,10 @@ class MainWindow(QMainWindow):
         if not self._cur_session or not self._agent or not self._agent.messages:
             return
         # Filter out internal task executor messages before saving
-        self._cur_session.messages = [m for m in self._agent.messages if not m.get("_internal")]
+        self._cur_session.messages = [
+            m for m in self._agent.messages
+            if (not m.get("_internal")) and (not self._is_task_internal_prompt_message(m))
+        ]
         # Strip skill augmentation from user messages for clean display on reload
         for msg in self._cur_session.messages:
             if msg.get("role") == "user":
@@ -2113,6 +2090,10 @@ class MainWindow(QMainWindow):
             self._show_settings_page()
 
     def closeEvent(self, event):
+        try:
+            self._save()
+        except Exception:
+            pass
         self._stop_browser_driver()
         event.accept()
 

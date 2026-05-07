@@ -159,7 +159,10 @@ class TaskExecutor:
 
         # 创建步骤（仅用于 UI 展示，不影响执行逻辑）
         from task_state import Step
-        for i, step_desc in enumerate(plan_data.get("steps", []), 1):
+        parsed_steps = list(plan_data.get("steps", []) or [])
+        if not parsed_steps:
+            parsed_steps = ["执行任务并在完成后给出结果总结"]
+        for i, step_desc in enumerate(parsed_steps, 1):
             step = Step(
                 id=f"step_{i}",
                 description=step_desc,
@@ -171,6 +174,10 @@ class TaskExecutor:
             "type": "plan_generated",
             "plan": self._current_task.plan,
             "steps": [s.to_dict() for s in self._current_task.steps],
+        }
+        yield {
+            "type": "task_progress",
+            "progress": {"tool_count": 0, "phase": "planning"},
         }
 
     # ── Execution Phase ───────────────────────────────────────
