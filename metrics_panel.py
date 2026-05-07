@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QBrush
 
-from theme import C_TEXT, C_DIM, C_PANEL, C_PANEL_HI, C_ACCENT, C_GREEN, C_RED, C_YELLOW
+from theme import C_TEXT, C_DIM, C_PANEL, C_PANEL_HI, C_ACCENT, C_GREEN, C_RED, C_YELLOW, build_combobox_stylesheet
 
 
 def _is_light(cfg) -> bool:
@@ -68,7 +68,7 @@ class MiniBarChart(QWidget):
         self.title = title
         self.data = data  # [(label, value), ...]
         self.color = color
-        self.setMinimumHeight(160)
+        self.setMinimumHeight(190)
 
     def set_data(self, data: list[tuple[str, float]]):
         self.data = data
@@ -86,7 +86,7 @@ class MiniBarChart(QWidget):
         margin_left = 40
         margin_right = 16
         margin_top = 28
-        margin_bottom = 24
+        margin_bottom = 42
         chart_w = w - margin_left - margin_right
         chart_h = h - margin_top - margin_bottom
 
@@ -124,8 +124,14 @@ class MiniBarChart(QWidget):
             painter.setPen(QPen(QColor(C_DIM), 1))
             small_font = QFont("Segoe UI", 8)
             painter.setFont(small_font)
-            painter.drawText(int(x), margin_top + chart_h + 14, int(bar_w), 16,
-                           Qt.AlignmentFlag.AlignHCenter, label[:6])
+            painter.drawText(
+                int(x) - 8,
+                margin_top + chart_h + 10,
+                int(bar_w) + 16,
+                26,
+                int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                label[:10],
+            )
 
         painter.end()
 
@@ -137,16 +143,20 @@ class MetricsPanel(QWidget):
         super().__init__(parent)
         self.cfg = cfg
         self.setObjectName("MetricsPanel")
-        self.log_dir = Path("logs/tasks")
+        ws = getattr(cfg, 'workspace', '') or str(Path(__file__).resolve().parent)
+        self.log_dir = Path(ws) / "logs" / "tasks"
         self._setup_ui()
         # Auto-refresh every 30s
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.refresh)
         self._timer.start(30000)
+        # Initial load on first show
+        QTimer.singleShot(500, self.refresh)
 
     def _setup_ui(self):
         txt = "#0f172a" if _is_light(self.cfg) else C_TEXT
         dim = "#64748b" if _is_light(self.cfg) else C_DIM
+        combo_css = build_combobox_stylesheet("light" if _is_light(self.cfg) else "dark")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
@@ -161,10 +171,8 @@ class MetricsPanel(QWidget):
 
         self.range_combo = QComboBox()
         self.range_combo.addItems(["Last 7 days", "Last 30 days", "All time"])
-        self.range_combo.setStyleSheet(
-            f"QComboBox{{background:{C_PANEL};color:{txt};border:1px solid rgba(255,255,255,0.1);"
-            f"border-radius:6px;padding:4px 10px;font-size:12px;}}"
-        )
+        self.range_combo.setMaxVisibleItems(12)
+        self.range_combo.setStyleSheet(combo_css)
         self.range_combo.currentIndexChanged.connect(self.refresh)
         header.addWidget(self.range_combo)
 

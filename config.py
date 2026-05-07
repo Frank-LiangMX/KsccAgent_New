@@ -56,7 +56,7 @@ class Config:
     # Agent / Skill / memory (local-only)
     skills_enabled: bool = True
     skill_debug_log: bool = False
-    memory_injection_enabled: bool = True
+    memory_injection_enabled: bool = False
     auto_save_skill_threshold: float = 75.0  # 自动保存 skill 的分数阈值
     # P5-5: Feature flags
     feature_task_mode: bool = True          # 任务状态机模式
@@ -65,6 +65,9 @@ class Config:
     feature_risk_templates: bool = True     # 风控模板检测
     feature_evidence_capture: bool = True   # 网页/设备证据采集
     feature_adb_tools: bool = False         # ADB 设备工具（默认关闭，需手动开启）
+    feature_browser_tools: bool = False      # 浏览器 CDP 工具（默认关闭，需手动开启+安装扩展）
+    # Runtime-only (not persisted): exclude recent session archives from memory injection
+    _exclude_session_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -170,6 +173,7 @@ def load_config() -> Config:
                 "feature_risk_templates",
                 "feature_evidence_capture",
                 "feature_adb_tools",
+                "feature_browser_tools",
             ):
                 if key in data:
                     setattr(cfg, key, data[key])
@@ -233,6 +237,7 @@ def save_config(cfg: Config):
         "feature_risk_templates": cfg.feature_risk_templates,
         "feature_evidence_capture": cfg.feature_evidence_capture,
         "feature_adb_tools": cfg.feature_adb_tools,
+        "feature_browser_tools": cfg.feature_browser_tools,
     }
     CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 

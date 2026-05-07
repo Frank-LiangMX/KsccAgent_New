@@ -39,9 +39,17 @@ def quark_icon(kind: str, size: int = 18, fg: Optional[str] = None) -> QIcon:
         p.drawLine(int(w * 0.62), int(w * 0.14), int(w * 0.62), int(w * 0.34))
         p.drawLine(int(w * 0.62), int(w * 0.34), int(w * 0.78), int(w * 0.34))
     elif kind == "settings":
-        for i in range(3):
-            y = int(w * (0.30 + i * 0.20))
-            p.drawLine(int(w * 0.22), y, int(w * 0.78), y)
+        rails = [
+            (0.30, 0.34),
+            (0.50, 0.62),
+            (0.70, 0.46),
+        ]
+        for y_ratio, knob_x in rails:
+            y = w * y_ratio
+            p.drawLine(int(w * 0.20), int(y), int(w * 0.80), int(y))
+            p.setBrush(QBrush(c))
+            p.drawEllipse(QRectF(w * knob_x - w * 0.055, y - w * 0.055, w * 0.11, w * 0.11))
+            p.setBrush(Qt.BrushStyle.NoBrush)
     elif kind == "stop":
         p.setBrush(QBrush(c))
         p.setPen(Qt.PenStyle.NoPen)
@@ -80,6 +88,26 @@ def quark_icon(kind: str, size: int = 18, fg: Optional[str] = None) -> QIcon:
     elif kind == "panels":
         p.drawRoundedRect(QRectF(w * 0.12, w * 0.20, w * 0.30, w * 0.60), 2.0, 2.0)
         p.drawRoundedRect(QRectF(w * 0.50, w * 0.20, w * 0.38, w * 0.60), 2.0, 2.0)
+    elif kind == "chart_bar":
+        p.drawRoundedRect(QRectF(w * 0.18, w * 0.52, w * 0.14, w * 0.24), 1.6, 1.6)
+        p.drawRoundedRect(QRectF(w * 0.43, w * 0.36, w * 0.14, w * 0.40), 1.6, 1.6)
+        p.drawRoundedRect(QRectF(w * 0.68, w * 0.24, w * 0.14, w * 0.52), 1.6, 1.6)
+    elif kind == "list":
+        for i in range(3):
+            cy = w * (0.28 + i * 0.22)
+            p.drawLine(int(w * 0.24), int(cy), int(w * 0.76), int(cy))
+    elif kind == "spark":
+        path = QPainterPath()
+        path.moveTo(w * 0.50, w * 0.16)
+        path.lineTo(w * 0.59, w * 0.41)
+        path.lineTo(w * 0.84, w * 0.50)
+        path.lineTo(w * 0.59, w * 0.59)
+        path.lineTo(w * 0.50, w * 0.84)
+        path.lineTo(w * 0.41, w * 0.59)
+        path.lineTo(w * 0.16, w * 0.50)
+        path.lineTo(w * 0.41, w * 0.41)
+        path.closeSubpath()
+        p.drawPath(path)
     elif kind == "bullet_list":
         for i in range(3):
             cy = int(w * (0.30 + i * 0.20))

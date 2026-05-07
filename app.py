@@ -47,7 +47,7 @@ import data_portability
 from ui_common import (
     APP_VERSION, _CODE_FONT_STACK, HAS_WEBENGINE,
     _is_light_theme, _tooltip_css, _with_tooltip_style, _fmt_k,
-    _make_plus_icon, _settings_icon, _ensure_attachments_dir,
+    _make_plus_icon, _ensure_attachments_dir,
     _is_image_path, _attachment_meta, _suppress_tk_root_window,
 )
 from editor import MonacoEditor, EditorTabHost
@@ -62,7 +62,7 @@ from file_tree import FileTree
 from settings_page import SettingsPage
 from metrics_panel import MetricsPanel
 from audit_panel import AuditPanel
-from agent_worker import AgentWorker, TaskWorker
+from agent_worker import AgentWorker, TaskWorker, ClassifyWorker
 
 from agent import Agent
 from task_executor import TaskExecutor
@@ -79,12 +79,13 @@ from config import (
 )
 from context import ContextTracker
 from session_store import SessionStore, Session
-from skills_ui import SkillSaveDialog, SkillsManagerDialog
+from skills_ui import SkillSaveDialog, SkillsPanel
 import re as _re
 
 from theme import (
     STYLESHEET,
     build_stylesheet,
+    polish_menu,
     md_chat_to_html,
     quark_icon,
     C_ACCENT,
@@ -123,16 +124,24 @@ class MainWindow(QMainWindow):
         os.chdir(self.config.workspace)
         self.store = SessionStore()
         self.config.mode = "solo"
-        self._agent: Optional[Agent] = None
-        self._worker: Optional[AgentWorker] = None
-        self._running = False
+        self._agent: Optional[Agent] = None  # deprecated, kept for _save() compatibility
+        self._worker: Optional[AgentWorker] = None  # deprecated, kept for compatibility
+        self._running = False  # deprecated, kept for compatibility
+        # Per-session worker/agent management
+        self._workers: dict[str, AgentWorker] = {}  # session_id → worker
+        self._agents: dict[str, Agent] = {}  # session_id → agent
+        self._task_executors: dict[str, TaskExecutor] = {}  # session_id → task executor
         self._task_mode = False  # True = TaskExecutor 状态机模式
+        self._last_task_executor = None  # 最近一次的 TaskExecutor（用于 resume）
         self._cur_session: Optional[Session] = None
         self._session_run_state: dict[str, str] = {}
         self._session_group_collapsed: dict[str, bool] = {}
         self._pending_user_message_meta: Optional[dict] = None
         self._pending_skill_draft: Optional[dict] = None
         self._last_agent_prompt: str = ""
+        self._classify_worker: Optional[QThread] = None
+        self._pending_send: Optional[dict] = None  # 分类期间暂存 prompt/attachments
+        self._auto_task: bool = False  # 自动分类结果：当前消息使用 task 模式
         ip = Path(__file__).parent / "icon.png"
         if ip.exists():
             self.setWindowIcon(QIcon(str(ip)))
@@ -150,6 +159,7 @@ class MainWindow(QMainWindow):
         self._on_mode_toggle(self.config.mode == "solo")
         self._tooltip_suppressed_until = 0.0
         self._open_latest_session_on_startup()
+        self._start_browser_driver()
 
     def eventFilter(self, obj, event):
         try:
@@ -266,7 +276,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "mode_btn"):
             self.mode_btn.setStyleSheet(
                 _with_tooltip_style(
-                    f"QPushButton{{background:transparent;border:none;color:{dim};border-radius:8px;font-size:11px;padding:0 14px}}"
+                    f"QPushButton{{background:transparent;border:none;color:{dim};border-radius:10px;font-size:11px;font-weight:600;padding:0 12px;text-align:center;}}"
+                    f"QPushButton::icon{{padding-left:2px;}}"
                     f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}"
                     f"QPushButton:checked{{background:{accent_sel};color:{accent}}}"
                     f"QPushButton:checked:hover{{background:{accent_sel};color:{accent}}}",
@@ -277,7 +288,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_task_mode_btn"):
             self._task_mode_btn.setStyleSheet(
                 _with_tooltip_style(
-                    f"QPushButton{{background:transparent;border:none;color:{dim};border-radius:8px;font-size:11px;padding:0 14px}}"
+                    f"QPushButton{{background:transparent;border:none;color:{dim};border-radius:10px;font-size:11px;font-weight:600;padding:0 12px;text-align:center;}}"
+                    f"QPushButton::icon{{padding-left:2px;}}"
                     f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}"
                     f"QPushButton:checked{{background:{accent_sel};color:{accent}}}"
                     f"QPushButton:checked:hover{{background:{accent_sel};color:{accent}}}",
@@ -317,7 +329,21 @@ class MainWindow(QMainWindow):
                 )
             )
             if not (hasattr(self, "content_stack") and self.content_stack.currentIndex() == 1):
-                self.settings_btn.setIcon(_settings_icon(light, 18))
+                self.settings_btn.setIcon(quark_icon("settings", 18))
+        _tb_btn_css = (
+            f"QPushButton{{background:transparent;border:none;border-radius:10px;padding:0 10px;color:{dim};font-size:11px;font-weight:600;text-align:center;}}"
+            f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}"
+        )
+        if hasattr(self, "skills_btn"):
+            self.skills_btn.setStyleSheet(_with_tooltip_style(_tb_btn_css, light))
+        if hasattr(self, "metrics_btn"):
+            self.metrics_btn.setStyleSheet(_with_tooltip_style(_tb_btn_css, light))
+        if hasattr(self, "audit_btn"):
+            self.audit_btn.setStyleSheet(_with_tooltip_style(_tb_btn_css, light))
+        if hasattr(self, "ws_lbl"):
+            self.ws_lbl.setStyleSheet(
+                f"color:{dim};font-size:11px;font-weight:500;background:transparent;max-width:180px;padding-left:2px;"
+            )
         if hasattr(self, "file_sidebar"):
             self.file_sidebar.setStyleSheet("background:#f5f5f5;" if light else "background:transparent;")
         if hasattr(self, "session_panel"):
@@ -403,13 +429,17 @@ class MainWindow(QMainWindow):
         self.mode_btn = QPushButton("Solo" if self.config.mode == "solo" else "IDE")
         self.mode_btn.setCheckable(True)
         self.mode_btn.setChecked(self.config.mode == "solo")
-        self.mode_btn.setFixedHeight(34)
+        self.mode_btn.setFixedHeight(32)
+        self.mode_btn.setIcon(quark_icon("panels", 16))
+        self.mode_btn.setIconSize(QSize(16, 16))
         self.mode_btn.toggled.connect(self._on_mode_toggle)
         tb.addWidget(self.mode_btn)
         self._task_mode_btn = QPushButton("Task")
         self._task_mode_btn.setCheckable(True)
         self._task_mode_btn.setChecked(False)
-        self._task_mode_btn.setFixedHeight(34)
+        self._task_mode_btn.setFixedHeight(32)
+        self._task_mode_btn.setIcon(quark_icon("spark", 16))
+        self._task_mode_btn.setIconSize(QSize(16, 16))
         self._task_mode_btn.setToolTip("切换任务状态机模式 (Plan→Execute→Reflect)")
         self._task_mode_btn.toggled.connect(self._on_task_mode_toggle)
         tb.addWidget(self._task_mode_btn)
@@ -441,6 +471,8 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._toolbar_spacer)
         light = str(getattr(self.config, "theme", "dark")).lower() == "light"
         hover_bg = "rgba(0,0,0,0.06)" if light else "rgba(255,255,255,0.08)"
+        dim = "#333333" if light else C_DIM
+        hi_text = "#000000" if light else C_TEXT
         self.ws_btn = QPushButton()
         self.ws_btn.setFixedSize(34, 34)
         self.ws_btn.setIcon(quark_icon("folder", 18))
@@ -454,40 +486,69 @@ class MainWindow(QMainWindow):
         self.ws_btn.setToolTip("Change workspace")
         self.ws_btn.clicked.connect(self._chg_ws)
         tb.addWidget(self.ws_btn)
-        self.ws_lbl = QLabel(self._short(self.config.workspace, 30))
+        self.ws_lbl = QLabel(self._ws_display(self.config.workspace))
         tb.addWidget(self.ws_lbl)
         self.settings_btn = QPushButton("设置")
-        self.settings_btn.setIcon(_settings_icon(light, 18))
-        self.settings_btn.setIconSize(QSize(18, 18))
-        self.settings_btn.setMinimumHeight(34)
+        self.settings_btn.setIcon(quark_icon("settings", 16))
+        self.settings_btn.setIconSize(QSize(16, 16))
+        self.settings_btn.setMinimumHeight(32)
         self.settings_btn.clicked.connect(self._settings)
+        self.settings_btn.setStyleSheet(
+            _with_tooltip_style(
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px}}"
+                f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
+                light,
+            )
+        )
         tb.addWidget(self.settings_btn)
         self.skills_btn = QPushButton("Skills")
-        self.skills_btn.setIcon(quark_icon("bullet_list", 18))
-        self.skills_btn.setIconSize(QSize(18, 18))
-        self.skills_btn.setMinimumHeight(34)
+        self.skills_btn.setIcon(quark_icon("bullet_list", 16))
+        self.skills_btn.setIconSize(QSize(16, 16))
+        self.skills_btn.setMinimumHeight(32)
         self.skills_btn.setToolTip("管理本地 Skills")
-        self.skills_btn.clicked.connect(self._open_skills_manager)
+        self.skills_btn.clicked.connect(self._show_skills_page)
+        self.skills_btn.setStyleSheet(
+            _with_tooltip_style(
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px}}"
+                f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
+                light,
+            )
+        )
         tb.addWidget(self.skills_btn)
         self.metrics_btn = QPushButton("Metrics")
-        self.metrics_btn.setIcon(quark_icon("chart_bar", 18))
-        self.metrics_btn.setIconSize(QSize(18, 18))
-        self.metrics_btn.setMinimumHeight(34)
+        self.metrics_btn.setIcon(quark_icon("chart_bar", 16))
+        self.metrics_btn.setIconSize(QSize(16, 16))
+        self.metrics_btn.setMinimumHeight(32)
         self.metrics_btn.setToolTip("指标看板")
         self.metrics_btn.clicked.connect(self._show_metrics_page)
+        self.metrics_btn.setStyleSheet(
+            _with_tooltip_style(
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px}}"
+                f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
+                light,
+            )
+        )
         tb.addWidget(self.metrics_btn)
         self.audit_btn = QPushButton("Audit")
-        self.audit_btn.setIcon(quark_icon("list", 18))
-        self.audit_btn.setIconSize(QSize(18, 18))
-        self.audit_btn.setMinimumHeight(34)
+        self.audit_btn.setIcon(quark_icon("list", 16))
+        self.audit_btn.setIconSize(QSize(16, 16))
+        self.audit_btn.setMinimumHeight(32)
         self.audit_btn.setToolTip("会话审计")
         self.audit_btn.clicked.connect(self._show_audit_page)
+        self.audit_btn.setStyleSheet(
+            _with_tooltip_style(
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px}}"
+                f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
+                light,
+            )
+        )
         tb.addWidget(self.audit_btn)
         r.addWidget(tb)
 
         # Splitter
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setHandleWidth(2)
+        self.splitter.splitterMoved.connect(self._on_outer_splitter_moved)
 
         self.file_sidebar = QWidget()
         self.file_sidebar.setMinimumWidth(180)
@@ -555,6 +616,7 @@ class MainWindow(QMainWindow):
         self.task_panel.setMinimumWidth(240)
         self.task_panel.setMaximumWidth(500)
         self.task_panel.hide()
+        self.task_panel.resume_clicked.connect(self._resume_task)
         self.splitter.addWidget(self.task_panel)
         self.splitter.setStretchFactor(0, 0)  # file_sidebar
         self.splitter.setStretchFactor(1, 1)  # editor_tabs
@@ -570,6 +632,8 @@ class MainWindow(QMainWindow):
         self.content_stack.addWidget(self.metrics_panel)
         self.audit_panel = AuditPanel(self.config, self)
         self.content_stack.addWidget(self.audit_panel)
+        self.skills_panel = SkillsPanel(self.config, self)
+        self.content_stack.addWidget(self.skills_panel)
         self.content_stack.setCurrentIndex(0)
         self._sync_settings_toolbar_button()
         r.addWidget(self.content_stack, 1)
@@ -627,9 +691,13 @@ class MainWindow(QMainWindow):
         if not show_s:
             self.session_panel.hide()
 
+    def _desired_task_panel_width(self) -> int:
+        width = int(self._layout_read("task_panel_width", 420, int))
+        return max(320, min(500, width))
+
     def _compute_outer_split_sizes(self, total: int) -> list[int]:
         total = max(int(total), 680)
-        tw = 320 if self.task_panel.isVisible() else 0
+        tw = self._desired_task_panel_width() if self.task_panel.isVisible() else 0
         if self.mode_btn.isChecked():
             return [0, 0, total - tw, tw]
         if not self.file_sidebar.isVisible():
@@ -666,11 +734,35 @@ class MainWindow(QMainWindow):
         self._layout_after_first_show()
 
     def _redistribute_outer_splitter(self):
-        if self.mode_btn.isChecked():
-            return
         total = max(self.splitter.width(), 680)
         self.splitter.setSizes(self._compute_outer_split_sizes(total))
-        self._redistribute_session_inner()
+        if not self.mode_btn.isChecked():
+            self._redistribute_session_inner()
+
+    def _on_outer_splitter_moved(self, _pos: int, _index: int):
+        sizes = self.splitter.sizes()
+        if len(sizes) >= 4 and self.task_panel.isVisible() and sizes[3] > 0:
+            self._layout_write("task_panel_width", sizes[3])
+
+    def _ensure_task_panel_default_width(self):
+        if not self.task_panel.isVisible():
+            return
+        desired = self._desired_task_panel_width()
+        sizes = self.splitter.sizes()
+        if len(sizes) < 4:
+            total = max(self.splitter.width(), 680)
+            self.splitter.setSizes(self._compute_outer_split_sizes(total))
+            sizes = self.splitter.sizes()
+        if len(sizes) < 4:
+            return
+        current = sizes[3]
+        if current >= desired - 12:
+            return
+        delta = desired - current
+        sizes[3] = desired
+        take_idx = 2 if sizes[2] > 260 else 1
+        sizes[take_idx] = max(220, sizes[take_idx] - delta)
+        self.splitter.setSizes(sizes)
 
     def _redistribute_session_inner(self):
         sc = self.session_chat_splitter
@@ -750,7 +842,7 @@ class MainWindow(QMainWindow):
             self.mode_btn.setText("Solo")
             self.file_sidebar.hide()
             self.editor_tabs.hide()
-            self.splitter.setSizes([0, 0, w])
+            self.splitter.setSizes(self._compute_outer_split_sizes(w))
         else:
             self.mode_btn.setText("IDE")
             self.editor_tabs.show()
@@ -774,7 +866,16 @@ class MainWindow(QMainWindow):
             self.task_panel.show()
         else:
             self.task_panel.hide()
+        # 先立即给 task 面板明确默认宽度，再在布局稳定后补一次修正。
         QTimer.singleShot(0, self._redistribute_outer_splitter)
+        if checked:
+            QTimer.singleShot(0, self._ensure_task_panel_default_width)
+            QTimer.singleShot(80, self._ensure_task_panel_default_width)
+            QTimer.singleShot(120, self._redistribute_outer_splitter)
+            QTimer.singleShot(180, self._ensure_task_panel_default_width)
+            QTimer.singleShot(260, self._redistribute_outer_splitter)
+        else:
+            QTimer.singleShot(100, self._redistribute_outer_splitter)
 
     def _on_task_suggestion_accepted(self, text, attachments):
         """用户在建议条中点击"开启 Task 模式"。"""
@@ -822,8 +923,15 @@ class MainWindow(QMainWindow):
             self.config.workspace = ap
             save_config(self.config)
             os.chdir(ap)
-            self.ws_lbl.setText(self._short(ap, 30))
+            self.ws_lbl.setText(self._ws_display(ap))
             self.file_tree.set_workspace(ap)
+
+    def _ws_display(self, ws: str) -> str:
+        """Return display label for a workspace path ('Home' for home dir)."""
+        home = os.path.expanduser("~")
+        if ws and os.path.normcase(os.path.normpath(ws)) == os.path.normcase(os.path.normpath(home)):
+            return "Home"
+        return self._short(ws, 30)
 
     @staticmethod
     def _short(t, n):
@@ -853,6 +961,7 @@ class MainWindow(QMainWindow):
         card_hover = "rgba(2,6,23,0.06)" if light else C_PANEL_HI
         card_sel = "#eef6ff" if light else "rgba(94,233,255,0.18)"
         indicator = "#3b82f6" if light else C_ACCENT
+        bar_idle = "#9ca3af" if light else "#4b5563"
         title_col = "#000000" if light else "rgba(255,255,255,0.9)"
         meta_col = "#333333" if light else C_DIM
         ws_head = "#000000" if light else C_TEAL
@@ -873,7 +982,11 @@ class MainWindow(QMainWindow):
             grouped[key].append(s)
 
         for ws in group_order:
-            ws_name = Path(ws).name if ws not in ("", "(No workspace)") else "No workspace"
+            home = os.path.expanduser("~")
+            if ws not in ("", "(No workspace)"):
+                ws_name = "Home" if os.path.normcase(os.path.normpath(ws)) == os.path.normcase(os.path.normpath(home)) else Path(ws).name
+            else:
+                ws_name = "No workspace"
             expanded = not self._session_group_collapsed.get(ws, False)
             head = WorkspaceGroupHeader(ws, ws_name[:42], expanded=expanded)
             head.toggled.connect(self._on_session_group_toggled)
@@ -895,7 +1008,13 @@ class MainWindow(QMainWindow):
                 short_updated = raw_updated[:16]
                 if raw_updated:
                     try:
-                        short_updated = datetime.fromisoformat(raw_updated.replace("Z", "+00:00")).strftime("%m-%d %H:%M")
+                        dt = datetime.fromisoformat(raw_updated.replace("Z", "+00:00"))
+                        if dt.utcoffset() is not None and dt.utcoffset().total_seconds() == 0:
+                            # +00:00 offset likely means local time was stored
+                            # as UTC (legacy data); display as-is without conversion
+                            short_updated = dt.strftime("%m-%d %H:%M")
+                        else:
+                            short_updated = dt.astimezone().strftime("%m-%d %H:%M")
                     except Exception:
                         m = _re.match(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2})", raw_updated)
                         if m:
@@ -906,7 +1025,6 @@ class MainWindow(QMainWindow):
                 row_left = 5
                 row_right = 8
                 row_gap = 3
-                bar_width = 3
                 card.setStyleSheet(
                     f"QFrame{{background:{card_sel if selected else card_bg};border:none;border-radius:10px;margin:3px {card_margin_x}px;padding:{card_pad}px}}"
                     f"QFrame:hover{{background:{card_sel if selected else card_hover}}}"
@@ -922,20 +1040,21 @@ class MainWindow(QMainWindow):
                 row = QHBoxLayout(card)
                 row.setContentsMargins(row_left, 8, row_right, 8)
                 row.setSpacing(row_gap)
-                bar = QFrame()
+                is_running = self._session_is_running(sid)
+                st = self._session_run_state.get(sid, "idle")
+                if is_running:
+                    st = "running"
                 if selected:
-                    is_running = bool(
-                        self._running
-                        and self._cur_session
-                        and self._cur_session.id == sid
-                    )
-                    st = "running" if is_running else self._session_run_state.get(sid, "idle")
-                    bar = SessionActivityBar(indicator, running=is_running, state=st)
+                    # Selected: always blue/accent; reset completed/failed to idle
+                    if st in ("success", "error"):
+                        self._session_run_state[sid] = "idle"
+                        st = "idle"
+                    bar = SessionActivityBar(indicator, running=(st == "running"), state=st)
                 else:
-                    bar = QFrame()
-                    bar.setFixedWidth(bar_width)
-                    bar.setMinimumHeight(30)
-                    bar.setStyleSheet("QFrame{background:transparent;border:none;border-radius:2px;}")
+                    if st == "idle":
+                        bar = SessionActivityBar(bar_idle, running=False, state="idle")
+                    else:
+                        bar = SessionActivityBar(indicator, running=(st == "running"), state=st)
                 row.addWidget(bar)
                 body = QWidget()
                 body.setMinimumWidth(0)
@@ -966,65 +1085,145 @@ class MainWindow(QMainWindow):
         self._refresh_sessions()
 
     def _new_session_for_workspace(self, workspace_key: str):
+        home = os.path.expanduser("~")
         target_ws = workspace_key
         if target_ws in ("", "(No workspace)"):
-            target_ws = self.config.workspace
+            target_ws = home
         if target_ws and os.path.isdir(target_ws):
             self.config.workspace = os.path.abspath(target_ws)
-            self.ws_lbl.setText(self._short(self.config.workspace, 30))
+            self.ws_lbl.setText(self._ws_display(self.config.workspace))
             self.file_tree.set_workspace(self.config.workspace)
         mode = self.config.mode
-        session = self.store.create(title="", workspace=target_ws or self.config.workspace, mode=mode)
+        session = self.store.create(title="", workspace=target_ws or home, mode=mode)
         self._load_session(session.id)
 
     def _message_display_text(self, msg: dict) -> str:
         if msg.get("display_text") is not None:
-            return str(msg.get("display_text") or "")
+            return Agent.strip_skill_augmentation(str(msg.get("display_text") or ""))
         content = msg.get("content", "")
         if isinstance(content, str):
-            return content
+            return Agent.strip_skill_augmentation(content)
         if isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
-                    return str(part.get("text", ""))
-        return str(content or "")
+                    return Agent.strip_skill_augmentation(str(part.get("text", "")))
+        return Agent.strip_skill_augmentation(str(content or ""))
 
     def _on_sess_click(self, event, sid):
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        # Reset completed/failed indicator when user clicks on the session
+        st = self._session_run_state.get(sid, "idle")
+        if st in ("success", "error"):
+            self._session_run_state[sid] = "idle"
         self._load_session(sid)
 
+    def _connect_worker_signals(self, w, sid, is_task_worker=False):
+        """Connect worker signals with session_id context for multi-worker support.
+        Display signals are gated: they only update UI when sid is the current session.
+        State signals (done/error/finished) always fire to handle background save."""
+        w.setProperty("_session_id", sid)
+        # ── Display signals (gated by current session) ──
+        w.text_delta.connect(lambda t, _sid=sid: self.chat.append_stream(t) if self._is_current_session(_sid) else None)
+        w.tool_call.connect(lambda n, p, _sid=sid: self._on_tool_call_status(n, p) if self._is_current_session(_sid) else None)
+        w.tool_result.connect(lambda r, err=False, _sid=sid: self._on_tool_result_status(r, err) if self._is_current_session(_sid) else None)
+        w.diff_preview.connect(lambda p, o, n, _sid=sid: self.chat.add_diff(p, o, n) if self._is_current_session(_sid) else None)
+        w.kscc_status.connect(lambda s, _sid=sid: self.chat.set_kscc_status(s) if self._is_current_session(_sid) else None)
+        w.confirm_request.connect(lambda path, old, new, _sid=sid: self._on_confirm(path, old, new, _sid))
+        w.context_info.connect(lambda j, _sid=sid: self._on_ctx(j) if self._is_current_session(_sid) else None)
+        w.skill_info.connect(lambda p, _sid=sid: self._on_skill_info(p) if self._is_current_session(_sid) else None)
+        w.skill_draft.connect(lambda p, _sid=sid: self._on_skill_draft(p) if self._is_current_session(_sid) else None)
+        w.skill_auto_saved.connect(lambda sid2, sc, _sid=sid: self._on_skill_auto_saved(sid2, sc) if self._is_current_session(_sid) else None)
+        w.memory_hits.connect(lambda p, _sid=sid: self._on_memory_hits(p) if self._is_current_session(_sid) else None)
+        w.risk_template.connect(lambda p, _sid=sid: self._on_risk_template(p) if self._is_current_session(_sid) else None)
+        w.file_modified.connect(lambda p, c, _sid=sid: self._on_fmod(p, c) if self._is_current_session(_sid) else None)
+        # ── State signals (always fire for background save) ──
+        w.done.connect(lambda text, turns, cj, _sid=sid: self._on_done(text, turns, cj, _sid))
+        w.error.connect(lambda t, _sid=sid: self._on_err(t, _sid))
+        w.finished.connect(lambda _sid=sid: self._on_fin(_sid))
+        if is_task_worker:
+            w.task_start.connect(lambda tid, goal, _sid=sid: self._on_task_start(tid, goal) if self._is_current_session(_sid) else None)
+            w.plan_generated.connect(lambda pj, _sid=sid: self._on_plan_generated(pj, _sid))
+            w.task_progress.connect(lambda pj, _sid=sid: self._on_task_progress(pj, _sid))
+            w.task_complete.connect(lambda tid, rj, _sid=sid: self._on_task_complete(tid, rj) if self._is_current_session(_sid) else None)
+            w.task_failed.connect(lambda tid, err, _sid=sid: self._on_task_failed(tid, err, _sid))
+            w.task_resume.connect(lambda tid, goal, ri, _sid=sid: self._on_task_resume(tid, goal, ri) if self._is_current_session(_sid) else None)
+
+    def _disconnect_worker_signals(self, w):
+        """Disconnect all signals from a worker. Only call when stopping/destroying a worker."""
+        if w is None:
+            return
+        try:
+            # Block signals instead of wildcard disconnect to avoid Qt warnings
+            w.blockSignals(True)
+        except RuntimeError:
+            pass  # C++ object already deleted
+
+    def _session_is_running(self, sid: str) -> bool:
+        """Check if a session has an active worker."""
+        w = self._workers.get(sid)
+        return w is not None and w.isRunning()
+
+    def _is_current_session(self, sid: str) -> bool:
+        """Check if sid matches the currently displayed session."""
+        return bool(sid and self._cur_session and sid == self._cur_session.id)
+
     def _stop_worker_for_navigation(self):
-        if self._worker and self._worker.isRunning():
-            self._worker.stop()
-            self._worker.wait(2000)
-            if self._worker.isRunning():
-                self._worker.terminate()
-                self._worker.wait(2000)
+        """Stop current session's worker for navigation. Background sessions keep running."""
+        sid = self._cur_session.id if self._cur_session else None
+        if sid and sid in self._workers:
+            w = self._workers[sid]
+            if w.isRunning():
+                w.stop()
+                w.wait(2000)
+                if w.isRunning():
+                    w.terminate()
+                    w.wait(2000)
+            self._disconnect_worker_signals(w)
+            del self._workers[sid]
+        self._agents.pop(sid, None)
+        self._task_executors.pop(sid, None)
         self._running = False
+        self._agent = None
+        self._worker = None
         self._ctx_bind_sid = None
         self._pending_user_message_meta = None
         self.chat.end_stream()
-        self._dispose_agent_runtime()
 
     def _load_session(self, sid):
         self._suppress_tooltips_temporarily(1.2)
-        self._stop_worker_for_navigation()
+        # NOTE: Do NOT disconnect old worker signals — they stay connected and
+        # gated by _is_current_session(). Background workers keep running.
+        # Save current session state
+        self._ctx_bind_sid = None
+        self._pending_user_message_meta = None
         session = self.store.load(sid)
         if not session:
             return
+        self.config._exclude_session_ids = []
         self._cur_session = session
-        self._agent = None
-        self._worker = None
-        self._running = False
+        # Restore per-session state
+        self._agent = self._agents.get(sid)
+        self._worker = self._workers.get(sid)
+        self._running = self._session_is_running(sid)
+        # NOTE: Do NOT reconnect worker signals — they were connected at creation time.
         self._pending_skill_draft = None
         self.chat.show_save_skill_prompt(False)
         self._refresh_sessions()
         self.editor_tabs.clear_all_tabs()
         self.chat.clear_messages()
+        # Choose message source: live agent.messages if running, else session.messages
+        agent = self._agents.get(sid)
+        if self._running and agent and agent.messages:
+            source_messages = agent.messages
+        else:
+            source_messages = session.messages
         self.chat.begin_bulk_restore()
         try:
-            for m in session.messages:
+            for m in source_messages:
+                # Skip internal task executor messages (planning prompts, execution prompts)
+                if m.get("_internal"):
+                    continue
                 r = m.get("role", "")
                 c = m.get("content", "")
                 if r == "user":
@@ -1046,9 +1245,19 @@ class MainWindow(QMainWindow):
                     pass
         finally:
             self.chat.end_bulk_restore()
+        # If this session is still running, show streaming state
+        if self._running:
+            model_label = ""
+            if session.backend and session.model:
+                model_label = f"{session.backend}/{session.model}"
+            self.chat.start_stream(model_label=model_label)
+            self.chat.send_btn.setEnabled(False)
+        else:
+            # Restore send/stop button state for non-running sessions
+            self.chat.end_stream()
         if session.workspace and os.path.isdir(session.workspace):
             self.config.workspace = os.path.abspath(session.workspace)
-            self.ws_lbl.setText(self._short(self.config.workspace, 30))
+            self.ws_lbl.setText(self._ws_display(self.config.workspace))
             self.file_tree.set_workspace(self.config.workspace)
         if session.backend:
             self.config.backend = str(session.backend)
@@ -1058,16 +1267,15 @@ class MainWindow(QMainWindow):
             self.config.openai_active = str(session.model)
         self._init_chat_selectors()
         self.slbl.setText(f"Session: {session.title[:36]}" if session.title.strip() else "Session")
-        self._ctx_bind_sid = None
-        self._pending_user_message_meta = None
         snap = getattr(session, "context_info", None)
         self._ctx_apply_snapshot(snap if isinstance(snap, dict) else None)
         self.chat.set_empty_state(
-            not bool(session.messages),
+            not bool(source_messages),
             workspace=session.workspace or self.config.workspace,
             title=session.title if (session.title or "").strip() else "开始新会话",
-            subtitle="从这里开始规划、构建与迭代。" if not session.messages else "",
+            subtitle="从这里开始规划、构建与迭代。" if not source_messages else "",
         )
+        self.chat.send_btn.setEnabled(not self._running)
         self._suppress_tooltips_temporarily(0.8)
 
     def _sess_menu(self, pos):
@@ -1078,15 +1286,34 @@ class MainWindow(QMainWindow):
         if not sid:
             return
         m = QMenu(self)
+        light = str(getattr(self.config, "theme", "dark")).lower() == "light"
+        polish_menu(m, "light" if light else "dark", font_size=11)
         da = m.addAction("Delete")
         if m.exec(snd.mapToGlobal(pos)) == da:
             if self._cur_session and self._cur_session.id == sid:
                 self._new_session()
+            # Stop background worker for deleted session
+            if sid in self._workers:
+                w = self._workers[sid]
+                if w.isRunning():
+                    w.stop()
+                    w.wait(2000)
+                self._disconnect_worker_signals(w)
+                del self._workers[sid]
+            self._agents.pop(sid, None)
+            self._task_executors.pop(sid, None)
+            self._session_run_state.pop(sid, None)
             self.store.delete(sid)
             self._refresh_sessions()
 
     def _new_session(self):
-        self._stop_worker_for_navigation()
+        # NOTE: Do NOT disconnect old worker signals — they stay connected and
+        # gated by _is_current_session(). Background workers keep running.
+        # Exclude previous session's archives from memory injection in the new session
+        if self._cur_session:
+            self.config._exclude_session_ids = [self._cur_session.id]
+        else:
+            self.config._exclude_session_ids = []
         self._cur_session = None
         self._agent = None
         self._worker = None
@@ -1095,6 +1322,12 @@ class MainWindow(QMainWindow):
         self.chat.show_save_skill_prompt(False)
         self.editor_tabs.clear_all_tabs()
         self.chat.clear_messages()
+        # Reset workspace to Home (user home directory)
+        home = os.path.expanduser("~")
+        self.config.workspace = home
+        os.chdir(home)
+        self.ws_lbl.setText("Home")
+        self.file_tree.set_workspace(home)
         self._refresh_sessions()
         self.slbl.setText("New session")
         self._ctx_bind_sid = None
@@ -1102,16 +1335,53 @@ class MainWindow(QMainWindow):
         self._ctx_clear()
         self.chat.set_empty_state(
             True,
-            workspace=self.config.workspace,
+            workspace=home,
             title="开始新会话",
             subtitle="可以直接提问、规划任务，或拖入文件开始。",
         )
 
     # ── Send / Agent ───────────────────────────────────────
     def _on_send(self, text, attachments=None):
-        if self._running:
+        sid = self._cur_session.id if self._cur_session else None
+        if sid and self._session_is_running(sid):
             return
-        self._start_agent(text, attachments or [])
+        # 分类进行中，忽略重复发送
+        if self._classify_worker and self._classify_worker.isRunning():
+            return
+        # 如果用户已手动开启 task mode，直接走 task 流程
+        if self._task_mode:
+            self._start_agent(text, attachments or [])
+            return
+        # 自动分类：判断是否需要 plan 模式
+        prompt_str = str(text or "").strip()
+        if not prompt_str and not attachments:
+            return
+        self._pending_send = {"prompt": text, "attachments": attachments or []}
+        self._running = True
+        self.chat.send_btn.setEnabled(False)
+        self.slbl.setText("分析任务复杂度...")
+        cw = ClassifyWorker(self.config, prompt_str or "请查看附件。")
+        cw.finished.connect(self._on_classify_done)
+        self._classify_worker = cw
+        cw.start()
+
+    def _on_classify_done(self, is_complex: bool):
+        self._classify_worker = None
+        pending = self._pending_send
+        self._pending_send = None
+        if not pending:
+            self._running = False
+            self.chat.send_btn.setEnabled(True)
+            return
+        # 如果用户在分类期间切换到了一个正在运行的会话，取消
+        sid = self._cur_session.id if self._cur_session else None
+        if sid and self._session_is_running(sid):
+            self._running = False
+            self.chat.send_btn.setEnabled(True)
+            return
+        # 自动分类结果：complex 时为当前消息启用 task，不影响全局 _task_mode
+        self._auto_task = is_complex
+        self._start_agent(pending["prompt"], pending["attachments"])
 
     def _start_agent(self, prompt, attachments_meta=None):
         self._running = True
@@ -1154,7 +1424,8 @@ class MainWindow(QMainWindow):
 
         if self._cur_session is None:
             self._cur_session = self.store.create(title="", workspace=self.config.workspace, mode=mode)
-        self._session_run_state[self._cur_session.id] = "running"
+        sid = self._cur_session.id
+        self._session_run_state[sid] = "running"
         self._cur_session.workspace = os.path.abspath(self.config.workspace)
         self._cur_session.backend = "kscc" if backend == "Kscc" else "openai"
         self._cur_session.model = model
@@ -1184,7 +1455,16 @@ class MainWindow(QMainWindow):
         self.chat.send_btn.setEnabled(False)
         self.chat.start_stream(model_label=f"{backend}/{model}")
         self.slbl.setText("执行中...")
-        self._dispose_agent_runtime()
+        # Dispose previous agent for this session if any
+        prev_agent = self._agents.pop(sid, None)
+        if prev_agent:
+            try:
+                bk = getattr(prev_agent, "backend", None)
+                close_fn = getattr(bk, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception:
+                pass
         try:
             rmsgs = self._cur_session.messages if self._cur_session.messages else None
             agent = Agent(config=self.config, mode=mode, resume_messages=rmsgs)
@@ -1194,62 +1474,38 @@ class MainWindow(QMainWindow):
             self._running = False
             return
         self._agent = agent
-        self._ctx_bind_sid = self._cur_session.id
+        self._agents[sid] = agent
+        self._ctx_bind_sid = sid
 
-        if self._task_mode:
-            # 任务状态机模式：使用 TaskExecutor + TaskWorker
-            task_exec = TaskExecutor(agent, config=self.config, log_dir=os.path.join(self.config.workspace, "logs", "tasks"))
+        use_task = self._task_mode or self._auto_task
+        self._auto_task = False  # 一次性标记，用完即清
+
+        if use_task:
+            # 自动 task 时显示 task 面板并高亮按钮
+            if not self._task_mode:
+                self.task_panel.show()
+                QTimer.singleShot(0, self._ensure_task_panel_default_width)
+                # 设置按钮 checked 样式（不触发 _on_task_mode_toggle）
+                self._task_mode_btn.blockSignals(True)
+                self._task_mode_btn.setChecked(True)
+                self._task_mode_btn.blockSignals(False)
+            _ws = self.config.workspace or os.path.dirname(os.path.abspath(__file__))
+            task_exec = TaskExecutor(agent, config=self.config, log_dir=os.path.join(_ws, "logs", "tasks"))
+            self._last_task_executor = task_exec
+            self._task_executors[sid] = task_exec
             w = TaskWorker(task_exec, agent_prompt, [a.get("path", "") for a in attachments_meta if a.get("path")])
             self._worker = w
-            # Agent 兼容信号
-            w.text_delta.connect(self.chat.append_stream)
-            w.tool_call.connect(self.chat.add_tool)
-            w.tool_result.connect(self.chat.add_result)
-            w.diff_preview.connect(self.chat.add_diff)
-            w.kscc_status.connect(self.chat.set_kscc_status)
-            w.confirm_request.connect(self._on_confirm)
-            w.context_info.connect(self._on_ctx)
-            w.skill_info.connect(self._on_skill_info)
-            w.skill_draft.connect(self._on_skill_draft)
-            w.skill_auto_saved.connect(self._on_skill_auto_saved)
-            w.memory_hits.connect(self._on_memory_hits)
-            w.risk_template.connect(self._on_risk_template)
-            w.done.connect(self._on_done)
-            w.error.connect(self._on_err)
-            w.file_modified.connect(self._on_fmod)
-            w.finished.connect(self._on_fin)
-            # 任务状态机信号
-            w.task_start.connect(self._on_task_start)
-            w.step_start.connect(self._on_task_step_start)
-            w.step_complete.connect(self._on_task_step_complete)
-            w.step_failed.connect(self._on_task_step_failed)
-            w.step_retry.connect(self._on_task_step_retry)
-            w.reflection.connect(self._on_task_reflection)
-            w.task_progress.connect(self._on_task_progress)
-            w.task_complete.connect(self._on_task_complete)
-            w.task_failed.connect(self._on_task_failed)
+            self._workers[sid] = w
+            self._connect_worker_signals(w, sid, is_task_worker=True)
             w.start()
         else:
-            # 普通模式：使用 AgentWorker
             w = AgentWorker(agent, agent_prompt, [a.get("path", "") for a in attachments_meta if a.get("path")])
             self._worker = w
-            w.text_delta.connect(self.chat.append_stream)
-            w.tool_call.connect(self.chat.add_tool)
-            w.tool_result.connect(self.chat.add_result)
-            w.diff_preview.connect(self.chat.add_diff)
-            w.kscc_status.connect(self.chat.set_kscc_status)
-            w.confirm_request.connect(self._on_confirm)
-            w.context_info.connect(self._on_ctx)
-            w.skill_info.connect(self._on_skill_info)
-            w.skill_draft.connect(self._on_skill_draft)
-            w.skill_auto_saved.connect(self._on_skill_auto_saved)
-            w.memory_hits.connect(self._on_memory_hits)
-            w.risk_template.connect(self._on_risk_template)
-            w.done.connect(self._on_done)
-            w.error.connect(self._on_err)
-            w.file_modified.connect(self._on_fmod)
-            w.finished.connect(self._on_fin)
+            self._workers[sid] = w
+            self._connect_worker_signals(w, sid)
             w.start()
+        # Refresh AFTER worker starts so _session_is_running returns True for the indicator
+        self._refresh_sessions()
         if switched_runtime:
             self.slbl.setText(
                 f"后端已切换: {prev_backend}/{prev_model or '-'} -> {next_backend_key}/{model or '-'}（上下文连续性：尽力保持）"
@@ -1285,36 +1541,91 @@ class MainWindow(QMainWindow):
             return
         if self._cur_session is None or getattr(self, "_ctx_bind_sid", None) != self._cur_session.id:
             return
-        self._ctx_set_from_json(sj)
+        # 提取压缩提示字段（不传给 ring widget）
+        warning = s.pop("_warning", None)
+        note = s.pop("_note", None)
+        if warning:
+            self.chat.add_context_hint("", "compressing")
+            self.ctx_ring.set_compression_status("compressing")
+        elif note:
+            self.chat.add_context_hint("", "done")
+            self.ctx_ring.set_compression_status("done")
+        self._ctx_set_from_json(json.dumps(s))
         self._cur_session.context_info = s
 
-    def _on_confirm(self, path, old, new):
+    def _on_confirm(self, path, old, new, sid=None):
+        agent = self._agents.get(sid) if sid else self._agent
+        # Background session: auto-reject to avoid blocking the agent
+        if not self._is_current_session(sid):
+            if agent:
+                agent.reject()
+            return
         def accept():
-            self._agent.approve()
+            if agent:
+                agent.approve()
 
         def reject():
-            self._agent.reject()
+            if agent:
+                agent.reject()
 
         self.chat.add_review_card(path, old, new, accept, reject)
 
-    def _on_done(self, text, turns, cj):
-        self._ctx_bind_sid = None
-        if self._cur_session is not None:
-            self._session_run_state[self._cur_session.id] = "success"
-        self.chat.end_stream()
-        self.chat.set_kscc_status("")
-        self.slbl.setText(f"Done - {turns} turns")
-        try:
-            c = json.loads(cj)
-            self.tlbl.setText(f"in:{_fmt_k(c.get('total_input'))} out:{_fmt_k(c.get('total_output'))}")
-        except Exception:
-            pass
-        self._save()
+    def _on_done(self, text, turns, cj, sid=None):
+        if sid and self._cur_session and sid == self._cur_session.id:
+            self._ctx_bind_sid = None
+        if sid:
+            self._session_run_state[sid] = "success"
+        # Only update UI if this is the current session
+        is_current = sid and self._cur_session and sid == self._cur_session.id
+        if is_current:
+            self.chat.end_stream()
+            self.chat.set_kscc_status("")
+            self.slbl.setText(f"Done - {turns} turns")
+            try:
+                c = json.loads(cj)
+                self.tlbl.setText(f"in:{_fmt_k(c.get('total_input'))} out:{_fmt_k(c.get('total_output'))}")
+            except Exception:
+                pass
+        # Save session using the correct agent
+        agent = self._agents.get(sid) if sid else self._agent
+        session = self._cur_session if is_current else None
+        if not session and sid:
+            # Load session from store for background save
+            session = self.store.load(sid)
+        if session and agent and agent.messages:
+            # Filter out internal task executor messages before saving
+            session.messages = [m for m in agent.messages if not m.get("_internal")]
+            # Strip skill augmentation from user messages for clean display on reload
+            for msg in session.messages:
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        msg["content"] = Agent.strip_skill_augmentation(content)
+            # Apply display_text/attachments from _pending_user_message_meta before saving
+            if is_current and self._pending_user_message_meta:
+                for msg in reversed(session.messages):
+                    if msg.get("role") == "user":
+                        msg["display_text"] = self._pending_user_message_meta.get("display_text", "")
+                        msg["attachments"] = [dict(a) for a in self._pending_user_message_meta.get("attachments", [])]
+                        break
+                self._pending_user_message_meta = None
+            try:
+                for msg in reversed(session.messages):
+                    if msg.get("role") == "assistant":
+                        msg["model_label"] = ""
+                        break
+            except Exception:
+                pass
+            if not session.title or session.title in ("New Session", "New Chat"):
+                session.title = self.store.auto_title(agent.messages)
+            self.store.save(session)
+            if is_current:
+                self._refresh_sessions()
         if bool(getattr(self.config, "memory_injection_enabled", True)):
             try:
                 archive = {
-                    "session_id": self._cur_session.id if self._cur_session else "",
-                    "title": self._cur_session.title if self._cur_session else "",
+                    "session_id": sid or "",
+                    "title": session.title if session else "",
                     "user_prompt": self._last_agent_prompt,
                     "summary": text,
                     "turns": turns,
@@ -1351,69 +1662,191 @@ class MainWindow(QMainWindow):
         self.task_panel.clear()
         self.slbl.setText(f"Task {task_id}: Planning...")
 
-    def _on_task_step_start(self, step_id, description):
-        self.slbl.setText(f"Step {step_id}: {description[:60]}")
-
-    def _on_task_step_complete(self, step_id, success, output):
-        pass  # UI updated via task_progress
-
-    def _on_task_step_failed(self, step_id, error):
-        pass  # UI updated via task_progress
-
-    def _on_task_step_retry(self, step_id, retry_count):
-        self.slbl.setText(f"Retrying {step_id} (attempt {retry_count})...")
-
-    def _on_task_reflection(self, step_id, observation, suggestion):
-        pass  # Logged by TaskLogger
-
-    def _on_task_progress(self, progress_json):
-        try:
-            progress = json.loads(progress_json)
-            done = progress.get("completed", 0)
-            total = progress.get("total", 0)
-            self.slbl.setText(f"Task progress: {done}/{total}")
-        except Exception:
-            pass
-        # Refresh task panel from the worker's executor
-        if self._worker and hasattr(self._worker, 'task_executor'):
-            task_state = self._worker.task_executor.get_current_task()
+    def _on_plan_generated(self, plan_json, sid=None):
+        """计划生成后立即刷新 task panel 显示步骤列表"""
+        is_current = sid and self._cur_session and sid == self._cur_session.id
+        if not is_current:
+            return
+        task_exec = self._task_executors.get(sid)
+        if task_exec:
+            task_state = task_exec.get_current_task()
             if task_state:
                 self.task_panel.update_task_state(task_state)
 
+    def _on_task_progress(self, progress_json, sid=None):
+        is_current = sid and self._cur_session and sid == self._cur_session.id
+        try:
+            progress = json.loads(progress_json)
+            phase = progress.get("phase", "")
+            tool_count = progress.get("tool_count", 0)
+            if is_current:
+                if phase == "executing":
+                    self.slbl.setText(f"Executing... ({tool_count} tools used)")
+                elif phase == "completed":
+                    self.slbl.setText("Execution complete.")
+                elif phase == "max_turns":
+                    self.slbl.setText("Reached max turns, finalizing...")
+        except Exception:
+            pass
+        # Refresh task panel and update step progress
+        if is_current:
+            task_exec = self._task_executors.get(sid)
+            if task_exec:
+                task_state = task_exec.get_current_task()
+                if task_state:
+                    # 根据 tool_count 推进步骤状态
+                    self._advance_step_progress(task_state, tool_count, phase)
+                    self.task_panel.update_task_state(task_state)
+
+    def _advance_step_progress(self, task_state, tool_count, phase=""):
+        """根据工具调用次数推进步骤状态（启发式追踪）"""
+        from task_state import StepStatus, StepResult
+        steps = task_state.steps
+        if not steps:
+            return
+        # 完成/失败阶段：标记所有步骤为完成
+        if phase in ("completed", "max_turns"):
+            for step in steps:
+                if step.status != StepStatus.SUCCESS:
+                    step.mark_success(StepResult(success=True, output="Completed"))
+            return
+        total = len(steps)
+        # 第一个工具调用时标记 step_1 为 RUNNING
+        if tool_count == 0:
+            return
+        # 计算当前应该执行到哪一步（每 3 个工具调用推进一步，至少每个步骤 1 个工具调用）
+        steps_to_advance = min(tool_count // 3, total)
+        if steps_to_advance == 0 and tool_count > 0:
+            steps_to_advance = 1
+        for i, step in enumerate(steps):
+            if i < steps_to_advance - 1:
+                # 已完成的步骤
+                if step.status != StepStatus.SUCCESS:
+                    step.mark_success(StepResult(success=True, output="Completed"))
+            elif i == steps_to_advance - 1:
+                # 当前正在执行的步骤
+                if step.status == StepStatus.PENDING:
+                    step.mark_running()
+            # i >= steps_to_advance 的步骤保持 PENDING
+
     def _on_task_complete(self, task_id, result):
         self.slbl.setText(f"Task {task_id}: Complete")
+        self._resume_btn_hide()
+        # 自动 task 结束，恢复按钮状态
+        if not self._task_mode:
+            self._task_mode_btn.blockSignals(True)
+            self._task_mode_btn.setChecked(False)
+            self._task_mode_btn.blockSignals(False)
+        # 标记所有步骤为完成
+        task_exec = self._task_executors.get(self._cur_session.id if self._cur_session else None)
+        if task_exec:
+            task_state = task_exec.get_current_task()
+            if task_state:
+                from task_state import StepStatus, StepResult
+                for step in task_state.steps:
+                    if step.status != StepStatus.SUCCESS:
+                        step.mark_success(StepResult(success=True, output="Completed"))
+                self.task_panel.update_task_state(task_state)
 
-    def _on_task_failed(self, task_id, error):
-        self.slbl.setText(f"Task {task_id}: Failed - {error[:80]}")
+    def _on_task_failed(self, task_id, error, sid=None):
+        is_current = sid and self._cur_session and sid == self._cur_session.id
+        if is_current:
+            self.slbl.setText(f"Task {task_id}: Failed - {error[:80]}")
+            # 自动 task 失败，恢复按钮状态
+            if not self._task_mode:
+                self._task_mode_btn.blockSignals(True)
+                self._task_mode_btn.setChecked(False)
+                self._task_mode_btn.blockSignals(False)
+            # 显示恢复按钮
+            task_exec = self._task_executors.get(sid) or self._last_task_executor
+            if task_exec:
+                task_state = task_exec.get_current_task()
+                if task_state:
+                    self.task_panel.show_resume(task_state)
+
+    def _on_task_resume(self, task_id, goal, resume_info):
+        plan = resume_info.get("plan", "")
+        plan_short = plan[:80] + "..." if len(plan) > 80 else plan
+        self.slbl.setText(f"Resuming task {task_id}")
+        self.chat.append_stream(f"\n\n--- Resuming task with previous plan: {plan_short} ---\n\n")
+
+    def _resume_task(self):
+        """恢复失败的任务"""
+        state = self.task_panel.get_resumable_state()
+        if not state:
+            return
+
+        sid = self._cur_session.id if self._cur_session else None
+        if sid and self._session_is_running(sid):
+            return
+
+        # 用当前 agent 创建新的 TaskExecutor
+        agent = self._agents.get(sid) if sid else self._agent
+        if not agent:
+            return
+
+        _ws = self.config.workspace or os.path.dirname(os.path.abspath(__file__))
+        task_exec = TaskExecutor(agent, config=self.config, log_dir=os.path.join(_ws, "logs", "tasks"))
+        self._last_task_executor = task_exec
+        if sid:
+            self._task_executors[sid] = task_exec
+
+        w = TaskWorker(task_exec, "", resume_state=state)
+        self._worker = w
+        if sid:
+            self._workers[sid] = w
+        self._connect_worker_signals(w, sid, is_task_worker=True)
+
+        self._running = True
+        self.chat.send_btn.setEnabled(False)
+        self._resume_btn_hide()
+        self.task_panel.clear()
+        w.start()
+
+    def _resume_btn_hide(self):
+        """隐藏恢复按钮"""
+        self.task_panel._resume_btn.hide()
+        self.task_panel._resumable_state = None
 
     def _on_stop(self):
-        if self._worker and self._worker.isRunning():
-            self._worker.stop()
-            self._worker.wait(2000)
-            if self._worker.isRunning():
-                self._worker.terminate()
-                self._worker.wait(2000)
+        # 停止分类线程（如果正在分类）
+        if self._classify_worker and self._classify_worker.isRunning():
+            self._classify_worker.terminate()
+            self._classify_worker.wait(2000)
+            self._classify_worker = None
+            self._pending_send = None
+        sid = self._cur_session.id if self._cur_session else None
+        if sid and sid in self._workers:
+            w = self._workers[sid]
+            if w.isRunning():
+                w.stop()
+                w.wait(2000)
+                if w.isRunning():
+                    w.terminate()
+                    w.wait(2000)
         self._ctx_bind_sid = None
         self._pending_user_message_meta = None
-        if self._cur_session is not None:
-            self._session_run_state[self._cur_session.id] = "idle"
+        if sid:
+            self._session_run_state[sid] = "idle"
         self._running = False
+        self._worker = None
         self.chat.end_stream()
-        self._dispose_agent_runtime()
         self._refresh_sessions()
         self.slbl.setText("Stopped")
 
-    def _on_err(self, t):
-        self._ctx_bind_sid = None
-        self._pending_user_message_meta = None
-        if self._cur_session is not None:
-            self._session_run_state[self._cur_session.id] = "error"
-        self.chat.add_error(t)
-        self.chat.end_stream()
-        self.slbl.setText("Error")
-        self._running = False
-        self._dispose_agent_runtime()
-        self._refresh_sessions()
+    def _on_err(self, t, sid=None):
+        is_current = sid and self._cur_session and sid == self._cur_session.id
+        if is_current:
+            self._ctx_bind_sid = None
+            self._pending_user_message_meta = None
+        if sid:
+            self._session_run_state[sid] = "error"
+        if is_current:
+            self.chat.add_error(t)
+            self.chat.end_stream()
+            self.slbl.setText("Error")
+            self._running = False
+            self._refresh_sessions()
 
     def _on_skill_info(self, payload: str):
         try:
@@ -1459,7 +1892,7 @@ class MainWindow(QMainWindow):
             self.chat.show_save_skill_prompt(False)
 
     def _on_memory_hits(self, payload: str):
-        """P3-5: Display memory hit summary in chat."""
+        """P3-5: Display memory hit summary in status bar (not in chat)."""
         try:
             hits = json.loads(payload)
         except Exception:
@@ -1476,18 +1909,26 @@ class MainWindow(QMainWindow):
         task_types = hits.get("task_types", [])
         type_str = f" [{','.join(task_types)}]" if task_types else ""
         if parts:
-            self.chat.add_memory_hits(f"Memory injected: {', '.join(parts)}{type_str}")
+            self.slbl.setText(f"Memory: {', '.join(parts)}{type_str}")
 
     def _on_risk_template(self, payload: str):
-        """P4-5: Display risk template warning in chat."""
+        """P4-5: Display risk template warning in status bar."""
         try:
             info = json.loads(payload)
         except Exception:
             return
         name = info.get("name", "敏感操作")
         risk = info.get("risk_level", "high")
-        icon = {"critical": "\u26d4", "high": "\u26a0\ufe0f", "medium": "\u2139\ufe0f"}.get(risk, "\u2139\ufe0f")
-        self.chat.add_memory_hits(f"{icon} Risk control: {name} ({risk})")
+        self.slbl.setText(f"Risk: {name} ({risk})")
+
+    def _on_tool_call_status(self, name: str, preview: str):
+        """Show current tool execution in status bar (replaces previous)."""
+        self.slbl.setText(f"Tool: {preview[:60]}")
+
+    def _on_tool_result_status(self, result: str, error: bool = False):
+        """Show tool error in status bar; ignore success."""
+        if error:
+            self.slbl.setText(f"Error: {result[:80]}")
 
     def _open_skill_save_dialog(self):
         draft = self._pending_skill_draft
@@ -1501,11 +1942,19 @@ class MainWindow(QMainWindow):
             self._pending_skill_draft = None
             self.chat.show_save_skill_prompt(False)
 
-    def _on_fin(self):
-        self._ctx_bind_sid = None
-        self.chat.send_btn.setEnabled(True)
-        self._running = False
-        self._worker = None
+    def _on_fin(self, sid=None):
+        is_current = sid and self._cur_session and sid == self._cur_session.id
+        if is_current:
+            self._ctx_bind_sid = None
+            self.chat.send_btn.setEnabled(True)
+            self.chat.end_stream()
+            self._worker = None
+            self._running = False
+        # Clean up per-session state (_on_done fires before _on_fin, so agent is safe to pop)
+        if sid:
+            self._workers.pop(sid, None)
+            self._agents.pop(sid, None)
+            self._task_executors.pop(sid, None)
         self._refresh_sessions()
 
     def _dispose_agent_runtime(self):
@@ -1530,7 +1979,14 @@ class MainWindow(QMainWindow):
     def _save(self):
         if not self._cur_session or not self._agent or not self._agent.messages:
             return
-        self._cur_session.messages = list(self._agent.messages)
+        # Filter out internal task executor messages before saving
+        self._cur_session.messages = [m for m in self._agent.messages if not m.get("_internal")]
+        # Strip skill augmentation from user messages for clean display on reload
+        for msg in self._cur_session.messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    msg["content"] = Agent.strip_skill_augmentation(content)
         try:
             bk = self.chat.current_backend_label()
             md = self.chat.current_model_name()
@@ -1584,19 +2040,25 @@ class MainWindow(QMainWindow):
             self.content_stack.setCurrentIndex(3)
         self._sync_settings_toolbar_button()
 
+    def _show_skills_page(self):
+        if hasattr(self, "content_stack"):
+            self.content_stack.setCurrentIndex(4)
+        self._sync_settings_toolbar_button()
+
     def _sync_settings_toolbar_button(self):
         if not hasattr(self, "settings_btn") or not hasattr(self, "content_stack"):
             return
         idx = self.content_stack.currentIndex()
-        light = str(getattr(self.config, "theme", "dark")).lower() == "light"
         if idx != 0:
             self.settings_btn.setText("返回")
             self.settings_btn.setIcon(quark_icon("arrow_left", 18))
             self.settings_btn.setToolTip("返回")
         else:
             self.settings_btn.setText("设置")
-            self.settings_btn.setIcon(_settings_icon(light, 18))
+            self.settings_btn.setIcon(quark_icon("settings", 18))
             self.settings_btn.setToolTip("设置")
+        if hasattr(self, "sbar"):
+            self.sbar.setVisible(idx == 0)
         self._sync_shell_chrome()
 
     def _on_settings_saved(self):
@@ -1605,7 +2067,44 @@ class MainWindow(QMainWindow):
         self.file_tree.set_workspace(self.config.workspace)
         self._init_chat_selectors()
         self._apply()
+        # Restart browser driver if feature flag changed
+        self._sync_browser_driver()
         self._show_main_page()
+
+    def _start_browser_driver(self):
+        """Start the browser CDP driver if the feature is enabled."""
+        if not getattr(self.config, 'feature_browser_tools', False):
+            return
+        try:
+            from browser_driver import start_browser_driver
+            ok = start_browser_driver()
+            if not ok:
+                print("[App] Browser driver failed to start. Check simple-websocket-server is installed.")
+        except ImportError as e:
+            print(f"[App] Browser driver import error: {e}")
+        except Exception as e:
+            print(f"[App] Browser driver start error: {e}")
+
+    def _stop_browser_driver(self):
+        """Stop the browser CDP driver."""
+        try:
+            from browser_driver import stop_browser_driver
+            stop_browser_driver()
+        except Exception:
+            pass
+
+    def _sync_browser_driver(self):
+        """Sync browser driver state with the feature flag."""
+        try:
+            from browser_driver import get_browser_driver
+            driver = get_browser_driver()
+            enabled = getattr(self.config, 'feature_browser_tools', False)
+            if enabled and not driver.is_running:
+                self._start_browser_driver()
+            elif not enabled and driver.is_running:
+                self._stop_browser_driver()
+        except Exception:
+            pass
 
     def _settings(self):
         if hasattr(self, "content_stack") and self.content_stack.currentIndex() != 0:
@@ -1613,10 +2112,10 @@ class MainWindow(QMainWindow):
         else:
             self._show_settings_page()
 
-    def _open_skills_manager(self):
-        dlg = SkillsManagerDialog(self)
-        dlg.exec()
-        self.slbl.setText("Skills updated")
+    def closeEvent(self, event):
+        self._stop_browser_driver()
+        event.accept()
+
 
 
 # ── Entry ───────────────────────────────────────────────────

@@ -27,6 +27,7 @@ from theme import (
     quark_icon, C_ACCENT, C_DIM, C_PANEL, C_PANEL_HI,
     C_TEXT, C_TEAL, C_ACCENT_LIGHT, C_TEAL_LIGHT,
     C_ACCENT_SEL, C_ACCENT_SEL_LIGHT,
+    polish_menu,
 )
 from chat_widgets import (
     ChatBubble, ChatInputEdit, ComposerAttachmentChip,
@@ -175,6 +176,7 @@ class ChatPanel(QWidget):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.viewport().setStyleSheet("background:transparent;")
         self.msg_container = QWidget()
         self.msg_container.setStyleSheet("background: transparent;")
         self.msg_layout = QVBoxLayout(self.msg_container)
@@ -189,14 +191,15 @@ class ChatPanel(QWidget):
         self._status_base_text = ""
         self._status_phase = 0
         self._status_timer = QTimer(self)
-        self._status_timer.setInterval(420)
+        self._status_timer.setInterval(120)
         self._status_timer.timeout.connect(self._tick_status)
         self.kscc_status_lbl = QLabel("")
         self.kscc_status_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.kscc_status_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.kscc_status_lbl.setContentsMargins(0, 0, 0, 0)
+        self.kscc_status_lbl.setAutoFillBackground(False)
+        self.kscc_status_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.kscc_status_lbl.hide()
-        l.addWidget(self.kscc_status_lbl)
 
         # Composer
         self._model_map: dict[str, list[str]] = {}
@@ -292,12 +295,21 @@ class ChatPanel(QWidget):
         iw = QVBoxLayout(self.input_wrap)
         iw.setContentsMargins(12, 6, 12, 12)
         iw.setSpacing(4)
+        self._status_row = QWidget()
+        self._status_row.setStyleSheet("background:transparent;")
+        sr = QHBoxLayout(self._status_row)
+        sr.setContentsMargins(0, 0, 0, 0)
+        sr.setSpacing(0)
+        sr.addWidget(self.kscc_status_lbl, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        sr.addStretch(1)
+        self._status_row.hide()
         self.save_skill_btn = QPushButton("Save Skill")
         self.save_skill_btn.setObjectName("saveSkillBtn")
         self.save_skill_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_skill_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.save_skill_btn.clicked.connect(self.add_skill_requested.emit)
         self.save_skill_btn.hide()
+        iw.addWidget(self._status_row)
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(0, 0, 0, 0)
         top_bar.addStretch(1)
@@ -495,14 +507,17 @@ class ChatPanel(QWidget):
         if workspace or title or subtitle:
             self.set_empty_context(workspace, title or "Start a new session", subtitle)
         self.scroll.setVisible((not self._empty_mode) and (not self._bulk_restore))
-        self.kscc_status_lbl.setVisible((not self._empty_mode) and bool(self._status_base_text))
+        show_status = (not self._empty_mode) and bool(self._status_base_text)
+        self.kscc_status_lbl.setVisible(show_status)
+        if hasattr(self, "_status_row"):
+            self._status_row.setVisible(show_status)
         self._empty_top_spacer.setVisible(self._empty_mode)
         self._empty_intro.setVisible(self._empty_mode)
         self._empty_bottom_spacer.setVisible(self._empty_mode)
-        self.input_wrap.setMinimumWidth(1080 if self._empty_mode else 0)
+        self.input_wrap.setMinimumWidth(640 if self._empty_mode else 0)
         self.input_wrap.setMaximumWidth(1080 if self._empty_mode else 16777215)
         self.input_wrap.setSizePolicy(
-            QSizePolicy.Policy.Preferred if self._empty_mode else QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding if self._empty_mode else QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
         )
         self._composer_left_spacer.setVisible(self._empty_mode)
@@ -582,29 +597,7 @@ class ChatPanel(QWidget):
     def _show_runtime_menu(self):
         menu = QMenu(self)
         light = _is_light_theme()
-        if light:
-            m_bg = "rgba(255,255,255,0.98)"
-            m_fg = "#0f172a"
-            m_sel = "rgba(12,74,110,0.12)"
-            m_sep = "rgba(15,23,42,0.10)"
-            m_disabled = "#64748b"
-        else:
-            m_bg = "#252526"
-            m_fg = "#ffffff"
-            m_sel = "#3a3a3d"
-            m_sep = "#3a3d41"
-            m_disabled = "#8f959f"
-        menu.setStyleSheet(
-            "QMenu {"
-            f"  background:{m_bg}; color:{m_fg}; border:none;"
-            "  border-radius:10px; padding:8px 6px;"
-            f"  font-family:{_CODE_FONT_STACK}; font-size:12px;"
-            "}"
-            f"QMenu::item {{ padding:7px 12px; border-radius:6px; margin:1px 4px; color:{m_fg}; }}"
-            f"QMenu::item:selected {{ background:{m_sel}; color:{m_fg}; }}"
-            f"QMenu::item:disabled {{ color:{m_disabled}; background:transparent; }}"
-            f"QMenu::separator {{ height:1px; background:{m_sep}; margin:6px 8px; }}"
-        )
+        polish_menu(menu, "light" if light else "dark", font_size=12)
         header_font = QFont(self.font())
         header_font.setPointSize(10)
         header_font.setBold(True)
@@ -654,10 +647,14 @@ class ChatPanel(QWidget):
         return self._model_name
 
     def set_kscc_status(self, text: str):
-        self._status_base_text = str(text or "").strip()
-        self._status_phase = 0
+        new_text = str(text or "").strip()
+        if new_text != self._status_base_text:
+            self._status_phase = 0  # 仅文本变化时重置动画到第0帧
+        self._status_base_text = new_text
         if not self._status_base_text:
             self.kscc_status_lbl.hide()
+            if hasattr(self, "_status_row"):
+                self._status_row.hide()
             self._status_timer.stop()
             return
         if not self._status_timer.isActive():
@@ -665,19 +662,20 @@ class ChatPanel(QWidget):
         self._apply_status_style()
         self._render_status()
         self.kscc_status_lbl.show()
+        if hasattr(self, "_status_row"):
+            self._status_row.show()
 
     def _apply_status_style(self):
         light = _is_light_theme()
-        accent_hex = str(getattr(load_config(), "accent_color", "#5ee9ff") or "#5ee9ff").strip()
-        if not accent_hex.startswith("#"):
-            accent_hex = "#5ee9ff"
-        fg = accent_hex
-        pad_l = 22
-        pad_r = 10
-        pad_t = 2
-        pad_b = 4
+        # Match the session activity bar blue, not the accent color setting
+        fg = "#3b82f6" if light else "#5ee9ff"
+        pad_l = 6
+        pad_r = 4
+        pad_t = 0
+        pad_b = 0
         self.kscc_status_lbl.setStyleSheet(
-            f"QLabel{{color:{fg};font-size:10px;padding:{pad_t}px {pad_r}px {pad_b}px {pad_l}px;background:transparent;}}"
+            f"QLabel{{color:{fg};font-size:10px;padding:{pad_t}px {pad_r}px {pad_b}px {pad_l}px;"
+            f"background:transparent;border:none;margin:0;}}"
         )
 
     def _render_status(self):
@@ -833,11 +831,14 @@ class ChatPanel(QWidget):
             self._stream_bubble.append_text(text)
         except RuntimeError:
             self._stream_bubble = None
-            return
-        if not self._bulk_restore:
-            QTimer.singleShot(40, self._scroll)
 
     def end_stream(self):
+        # Flush any pending throttled render before clearing reference
+        if self._stream_bubble:
+            try:
+                self._stream_bubble.finalize_stream()
+            except RuntimeError:
+                pass
         self._stream_bubble = None
         self.send_btn.setEnabled(True)
         self.send_btn.show()
@@ -854,7 +855,7 @@ class ChatPanel(QWidget):
         if self._stream_bubble:
             marker = "Failed ·" if error else "Done ·"
             try:
-                self._stream_bubble.append_text(f"{marker} {result[:400]}\n")
+                self._stream_bubble.append_text(f"{marker} {result[:120]}\n")
             except RuntimeError:
                 self._stream_bubble = None
 
@@ -865,6 +866,20 @@ class ChatPanel(QWidget):
                 self._stream_bubble.append_text(f"\n{text}\n")
             except RuntimeError:
                 self._stream_bubble = None
+
+    def add_context_hint(self, text: str, hint_type: str = "info"):
+        """在会话区显示上下文压缩提示。hint_type: 'compressing' | 'done'"""
+        if self._stream_bubble:
+            try:
+                if hint_type == "compressing":
+                    marker = "⏳ Context · 正在压缩上下文..."
+                else:
+                    marker = "✓ Context · 上下文压缩完成"
+                self._stream_bubble.append_text(f"\n{marker}\n")
+            except RuntimeError:
+                self._stream_bubble = None
+            if not self._bulk_restore:
+                QTimer.singleShot(40, self._scroll)
 
     def add_error(self, t):
         if self._stream_bubble:
@@ -883,22 +898,42 @@ class ChatPanel(QWidget):
         key = str(Path(filepath).as_posix()).lower() if filepath else f"unknown:{nm.lower()}"
         light = _is_light_theme()
         card_bg = "#f8fafc" if light else C_PANEL
-        card_bd = "#dbe3ee" if light else "transparent"
         name_col = "#0f172a" if light else C_TEXT
-        detail_bg = "#ffffff" if light else "transparent"
+        detail_bg = "transparent"
         detail_col = "#1f2937" if light else C_TEXT
         arrow_col = "#475569" if light else C_TEXT
         dim_col = "#64748b" if light else C_DIM
+        line_no_col = "#94a3b8" if light else "#7c8594"
+        code_font = "Consolas,'Cascadia Mono','Courier New',monospace"
+
+        def _line_html(no: int, sign: str, text: str, color: str) -> str:
+            return (
+                "<tr>"
+                f"<td style='width:44px;padding:0 10px 0 0;color:{line_no_col};"
+                f"text-align:right;vertical-align:top;white-space:pre'>{no}</td>"
+                f"<td style='width:14px;padding:0 8px 0 0;color:{color};vertical-align:top;white-space:pre'>{sign}</td>"
+                f"<td style='padding:0;color:{color};vertical-align:top;white-space:pre-wrap'>{_html.escape(text)}</td>"
+                "</tr>"
+            )
 
         def _build_fragment() -> str:
             ts = datetime.now().strftime("%H:%M:%S")
-            dt = f"<span style='color:{dim_col};font-size:10px'>[{ts}]</span><br>"
-            for ln in old.split('\n'):
-                dt += f"<span style='color:#ef4444'>- {_html.escape(ln)}</span><br>"
+            dt = (
+                f"<div style='color:{dim_col};font-size:10px;margin:0 0 6px 0'>[{ts}]</div>"
+                f"<table style='border-collapse:collapse;width:100%;font-family:{code_font};font-size:12px;line-height:1.55'>"
+            )
+            for idx, ln in enumerate(old.split('\n'), start=1):
+                dt += _line_html(idx, "-", ln, "#ef4444")
             if old and new:
-                dt += f"<span style='color:{dim_col}'>→</span><br>"
-            for ln in new.split('\n'):
-                dt += f"<span style='color:#22c55e'>+ {_html.escape(ln)}</span><br>"
+                dt += (
+                    "<tr>"
+                    f"<td style='width:44px;padding:2px 10px 2px 0;color:{line_no_col};text-align:right'> </td>"
+                    f"<td colspan='2' style='padding:2px 0;color:{dim_col}'>→</td>"
+                    "</tr>"
+                )
+            for idx, ln in enumerate(new.split('\n'), start=1):
+                dt += _line_html(idx, "+", ln, "#22c55e")
+            dt += "</table>"
             return dt
 
         existing = self._diff_cards.get(key)
@@ -914,7 +949,7 @@ class ChatPanel(QWidget):
 
         card = QFrame(self.msg_container)
         card.setStyleSheet(
-            f"QFrame{{background:{card_bg};border:1px solid {card_bd};border-radius:12px;margin:4px 10px}}"
+            f"QFrame{{background:{card_bg};border:none;border-radius:12px;margin:4px 10px}}"
         )
         card.setCursor(Qt.CursorShape.PointingHandCursor)
         cl = QVBoxLayout(card)
@@ -940,9 +975,11 @@ class ChatPanel(QWidget):
         detail.setReadOnly(True)
         detail.setFrameShape(QFrame.Shape.NoFrame)
         detail.setFont(QFont("Consolas", 10))
-        detail.setMaximumHeight(200)
+        detail.setMaximumHeight(560)
         detail.hide()
-        detail.setStyleSheet(f"QTextEdit{{background:{detail_bg};color:{detail_col};border:none;}}")
+        detail.setStyleSheet(
+            f"QTextEdit{{background:{detail_bg};color:{detail_col};border:none;padding:0;}}"
+        )
         parts = [_build_fragment()]
         detail.setHtml(parts[0])
         cl.addWidget(detail)

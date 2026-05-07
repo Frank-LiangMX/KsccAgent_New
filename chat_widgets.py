@@ -14,14 +14,14 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QPushButton, QPlainTextEdit,
     QScrollArea, QFrame, QDialog, QSizePolicy, QComboBox, QFontComboBox,
     QSpinBox, QToolButton, QApplication, QToolTip, QMenu,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QPoint, QPointF, QRect, QRectF, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter,
-    QPalette, QPen, QPixmap, QTextCursor, QTextOption, QIcon,
+    QPalette, QPen, QPixmap, QTextCursor, QTextOption, QIcon, QCursor, QKeySequence,
 )
 
 from ui_common import (
@@ -31,7 +31,8 @@ from ui_common import (
 )
 from config import load_config
 from theme import (
-    md_chat_to_html, quark_icon,
+    md_chat_to_html, md_code_to_html, split_markdown_blocks, quark_icon,
+    polish_menu,
     C_ACCENT, C_ACCENT_LIGHT, C_BORDER, C_DIM, C_PANEL, C_PANEL_HI,
     C_RED, C_TEAL, C_TEAL_LIGHT, C_TEXT, C_YELLOW,
 )
@@ -53,8 +54,67 @@ class BubbleTextEdit(QTextEdit):
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
+        if hasattr(self, "setCursorWidth"):
+            try:
+                self.setCursorWidth(0)
+            except Exception:
+                pass
+        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        self.viewport().setMouseTracking(True)
+        self._selecting = False
+        self._select_anchor = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            pos = event.position().toPoint()
+            if self.anchorAt(pos):
+                super().mousePressEvent(event)
+                return
+            self._selecting = True
+            self._select_anchor = self.cursorForPosition(pos)
+            cursor = self.textCursor()
+            cursor.setPosition(self._select_anchor.position())
+            self.setTextCursor(cursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            if self.anchorAt(pos):
+                super().mouseDoubleClickEvent(event)
+                return
+            cursor = self.cursorForPosition(pos)
+            cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+            self.setTextCursor(cursor)
+            self._selecting = False
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        if self._selecting and self._select_anchor is not None:
+            cursor = self.textCursor()
+            end_cursor = self.cursorForPosition(pos)
+            cursor.setPosition(self._select_anchor.position())
+            cursor.setPosition(end_cursor.position(), QTextCursor.MoveMode.KeepAnchor)
+            self.setTextCursor(cursor)
+            event.accept()
+            return
+        if self.anchorAt(pos):
+            self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._selecting:
+            self._selecting = False
+            event.accept()
+            return
         try:
             if event.button() == Qt.MouseButton.LeftButton:
                 pos = event.position().toPoint()
@@ -66,6 +126,22 @@ class BubbleTextEdit(QTextEdit):
         except Exception:
             pass
         super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        menu = self.createStandardContextMenu()
+        light = _is_light_theme()
+        polish_menu(menu, "light" if light else "dark", font_size=max(10, self.font().pointSize()))
+        menu.exec(event.globalPos())
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Copy):
+            cursor = self.textCursor()
+            if cursor.hasSelection():
+                QApplication.clipboard().setText(cursor.selectedText().replace("\u2029", "\n"))
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def wheelEvent(self, event):
         if self._scroll_area is not None:
@@ -221,8 +297,6 @@ class SessionActivityBar(QWidget):
         dim.setAlpha(90)
         bright = QColor(self._color)
         bright.setAlpha(240)
-        glow = QColor(self._color)
-        glow.setAlpha(130)
         sheen = QColor("#ffffff")
         sheen.setAlpha(175)
         center = self._phase
@@ -232,19 +306,29 @@ class SessionActivityBar(QWidget):
         g.setColorAt(0.0, dim)
         g.setColorAt(a, dim)
         g.setColorAt(center, bright)
-        g.setColorAt(c, dim)
-        g.setColorAt(1.0, dim)
+        if c > center:
+            g.setColorAt(c, dim)
         p.setPen(Qt.PenStyle.NoPen); p.setBrush(g); p.drawRoundedRect(QRectF(rect), 2.0, 2.0)
 
-        # Add a soft moving glow around the bright segment so the running
-        # state feels more lively without becoming visually noisy.
-        glow_g = QLinearGradient(0, 0, 0, rect.height())
-        glow_g.setColorAt(0.0, QColor(self._color.red(), self._color.green(), self._color.blue(), 0))
-        glow_g.setColorAt(max(0.0, center - 0.30), QColor(self._color.red(), self._color.green(), self._color.blue(), 0))
-        glow_g.setColorAt(center, glow)
-        glow_g.setColorAt(min(1.0, center + 0.30), QColor(self._color.red(), self._color.green(), self._color.blue(), 0))
-        glow_g.setColorAt(1.0, QColor(self._color.red(), self._color.green(), self._color.blue(), 0))
-        p.setBrush(glow_g); p.drawRoundedRect(QRectF(rect.adjusted(-1, 0, 1, 0)), 3.0, 3.0)
+        # Multi-layer glow: outer → mid → core, layered for a natural
+        # bloom / self-illuminating effect without visual noise.
+        for spread, alpha, span, radius in [
+            (4, 40, 0.48, 6.0),   # outer halo – widest, softest
+            (2, 80, 0.32, 4.0),   # mid bloom
+            (1, 155, 0.20, 3.0),  # core glow – tight, brightest
+        ]:
+            c_g = QColor(self._color)
+            c_g.setAlpha(alpha)
+            zero = QColor(self._color.red(), self._color.green(), self._color.blue(), 0)
+            gg = QLinearGradient(0, 0, 0, rect.height())
+            gg.setColorAt(0.0, zero)
+            gg.setColorAt(max(0.0, center - span), zero)
+            gg.setColorAt(center, c_g)
+            ge = min(1.0, center + span)
+            if ge > center:
+                gg.setColorAt(ge, zero)
+            p.setBrush(gg)
+            p.drawRoundedRect(QRectF(rect.adjusted(-spread, 0, spread, 0)), radius, radius)
 
         # A narrow white-blue sheen gives the brightest area a subtle glossy highlight.
         sheen_g = QLinearGradient(rect.left(), 0, rect.right(), 0)
@@ -258,6 +342,91 @@ class SessionActivityBar(QWidget):
         p.setClipRect(clip)
         p.setBrush(sheen_g); p.drawRoundedRect(QRectF(rect), 2.0, 2.0)
         p.restore()
+
+
+class CodeBlockWidget(QFrame):
+    def __init__(self, code_text: str, lang: str = "", scroll_area: Optional[QScrollArea] = None, parent=None):
+        super().__init__(parent)
+        self._scroll_area = scroll_area
+        self._code_text = str(code_text or "").rstrip("\n")
+        self._lang = str(lang or "").strip().lower() or "code"
+        self._content_width = 0
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        top = QWidget(self)
+        top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(12, 10, 12, 0)
+        top_layout.setSpacing(8)
+
+        self.lang_label = QLabel(self._lang, top)
+        top_layout.addWidget(self.lang_label)
+        top_layout.addStretch(1)
+
+        self.copy_btn = QPushButton("复制", top)
+        self.copy_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copy_btn.clicked.connect(self._copy_code)
+        top_layout.addWidget(self.copy_btn)
+        layout.addWidget(top)
+
+        self.code_view = BubbleTextEdit(self._scroll_area, self)
+        self.code_view.setFont(QFont("Consolas", 10))
+        self.code_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.code_view.document().setDocumentMargin(0)
+        self.code_view.setViewportMargins(0, 0, 0, 0)
+        self.code_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.code_view.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.code_view.document().documentLayout().documentSizeChanged.connect(self._sync_height)
+        layout.addWidget(self.code_view)
+
+        self.apply_theme()
+        self.code_view.setHtml(md_code_to_html(self._code_text, self._lang, light=_is_light_theme()))
+
+    def apply_theme(self):
+        light = _is_light_theme()
+        frame_bg = "#f7f8fa" if light else "#202226"
+        frame_border = "#d9dee6" if light else "#2f3440"
+        lang_fg = "#7b8694" if light else "#8f96a3"
+        btn_fg = "#6b7280" if light else "#a0a7b4"
+        btn_hover = "#111827" if light else "#ffffff"
+        self.setStyleSheet(
+            f"QFrame{{background:{frame_bg};border:1px solid {frame_border};border-radius:8px;}}"
+            f"QLabel{{background:transparent;border:none;color:{lang_fg};font-size:10px;}}"
+            f"QPushButton{{background:transparent;border:none;color:{btn_fg};font-size:10px;padding:0;}}"
+            f"QPushButton:hover{{color:{btn_hover};}}"
+            f"QTextEdit{{background:transparent;border:none;}}"
+        )
+
+    def set_content_width(self, width: int):
+        inner_width = max(120, int(width) - 24)
+        self._content_width = inner_width
+        doc = self.code_view.document()
+        doc.setTextWidth(float(inner_width))
+        self._sync_height()
+
+    def _sync_height(self, *_args):
+        doc = self.code_view.document()
+        if self._content_width > 0:
+            doc.setTextWidth(float(self._content_width))
+        layout_size = doc.documentLayout().documentSize()
+        doc_size = doc.size()
+        base_height = max(float(layout_size.height()), float(doc_size.height()))
+        height = math.ceil(base_height) + 14
+        target = max(30, height)
+        self.code_view.setFixedHeight(target)
+        self.updateGeometry()
+
+    def _copy_code(self):
+        try:
+            QApplication.clipboard().setText(self._code_text)
+            QToolTip.showText(QCursor.pos(), "已复制", self)
+        except Exception:
+            pass
 
 
 # ── ElidedLabel ─────────────────────────────────────────────
@@ -377,9 +546,12 @@ class ChatBubble(QFrame):
     def __init__(self, role, text="", parent=None, scroll_area: Optional[QScrollArea] = None, attachments: Optional[list[dict]] = None, model_label: str = "", render_markdown: bool = True):
         super().__init__(parent)
         self.role = role
+        self._scroll_area = scroll_area
         self._raw_text = ""
         self._attachments = list(attachments or [])
         self._render_markdown = bool(render_markdown)
+        self._segment_widgets: list[QWidget] = []
+        self._render_timer: Optional[QTimer] = None  # throttled streaming render
         light = _is_light_theme()
         accent_hex = str(getattr(load_config(), "accent_color", "#5ee9ff") or "#5ee9ff").strip()
         text_user = "#000000" if light else "#eef4f8"
@@ -400,7 +572,7 @@ class ChatBubble(QFrame):
         else:
             inner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         il = QVBoxLayout(inner)
-        il.setContentsMargins(12, 8, 12, 8)
+        il.setContentsMargins(10, 8, 10, 8)
         il.setSpacing(4)
         names = {"user": "You", "assistant": "Kscc UI", "tool": "Tool", "error": "Error"}
         self.header = QLabel(names.get(role, role), inner)
@@ -410,6 +582,11 @@ class ChatBubble(QFrame):
         self.model_tag.setFont(QFont("Segoe UI", 9))
         self.body = BubbleTextEdit(scroll_area, inner)
         self.body.link_clicked.connect(self._on_link_clicked)
+        self.segment_wrap = QWidget(inner)
+        self.segment_layout = QVBoxLayout(self.segment_wrap)
+        self.segment_layout.setContentsMargins(0, 0, 0, 0)
+        self.segment_layout.setSpacing(8)
+        self.segment_wrap.hide()
         self.attachments_wrap = QWidget(inner)
         self.attachments_layout = QHBoxLayout(self.attachments_wrap)
         self.attachments_layout.setContentsMargins(0, 0, 0, 0)
@@ -425,7 +602,7 @@ class ChatBubble(QFrame):
         else:
             self.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.body.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.body.document().setDocumentMargin(4)
+        self.body.document().setDocumentMargin(2)
         self.body.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self.body.document().documentLayout().documentSizeChanged.connect(self._fit)
         if role == "user":
@@ -457,6 +634,7 @@ class ChatBubble(QFrame):
         il.addLayout(head_row)
         il.addWidget(self.attachments_wrap)
         il.addWidget(self.body)
+        il.addWidget(self.segment_wrap)
         if role == "user":
             outer.addStretch()
             outer.addWidget(inner)
@@ -493,11 +671,14 @@ class ChatBubble(QFrame):
         return max(120, min(cap, w - 20))
 
     def _fit(self):
+        cap = self._avail_inner_content_width()
+        if self.segment_wrap.isVisible():
+            self._fit_segment_widgets(cap)
+            return
         if not self.body.isVisible():
             return
         doc = self.body.document()
         side_pad = 8
-        cap = self._avail_inner_content_width()
         if self.role == "user":
             fm = QFontMetrics(self.body.font())
             plain = self.body.toPlainText()
@@ -516,29 +697,41 @@ class ChatBubble(QFrame):
             else:
                 tw = self._avail_inner_content_width()
             doc.setTextWidth(float(tw))
-            h = math.ceil(float(doc.size().height())) + side_pad * 2
+            layout_size = doc.documentLayout().documentSize()
+            doc_size = doc.size()
+            base_h = max(float(layout_size.height()), float(doc_size.height()))
+            h = math.ceil(base_h) + side_pad * 2 + 8
             self.body.setFixedHeight(int(max(h, 36)))
 
     def set_text(self, t):
         self._raw_text = str(t or "")
-        self.body.setVisible(bool(str(t or "").strip()))
         if self.role == "assistant" and self._render_markdown:
-            self.body.setHtml(md_chat_to_html(self._raw_text, light=_is_light_theme()))
+            self._render_assistant_content()
         else:
+            self.segment_wrap.hide()
+            self.body.setVisible(bool(str(t or "").strip()))
             self.body.setPlainText(self._raw_text)
         QTimer.singleShot(0, self._fit)
 
     def append_text(self, t):
         if self.role == "assistant":
-            if not self.body.isVisible():
-                self.body.setVisible(True)
             self._raw_text += str(t or "")
             if self._render_markdown:
-                self.body.setHtml(md_chat_to_html(self._raw_text, light=_is_light_theme()))
+                # Throttle: batch deltas, render at most ~16fps during streaming
+                if self._render_timer is None:
+                    self._render_timer = QTimer(self)
+                    self._render_timer.setSingleShot(True)
+                    self._render_timer.timeout.connect(self._render_assistant_content)
+                if not self._render_timer.isActive():
+                    self._render_timer.start(60)
+                # Don't call _fit here; _render_assistant_content handles fit+scroll
             else:
+                if not self.body.isVisible():
+                    self.body.setVisible(True)
+                self.segment_wrap.hide()
                 self.body.setPlainText(self._raw_text)
+                QTimer.singleShot(0, self._fit)
             self.body.moveCursor(QTextCursor.MoveOperation.End)
-            QTimer.singleShot(0, self._fit)
         else:
             self.body.setReadOnly(False)
             try:
@@ -548,6 +741,12 @@ class ChatBubble(QFrame):
             finally:
                 self.body.setReadOnly(True)
 
+    def finalize_stream(self):
+        """Force final render after streaming ends (flush pending throttle)."""
+        if self._render_timer and self._render_timer.isActive():
+            self._render_timer.stop()
+            self._render_assistant_content()
+
     def _on_link_clicked(self, href: str):
         href = str(href or "")
         if not href.startswith("copycode:"):
@@ -556,7 +755,7 @@ class ChatBubble(QFrame):
             idx = int(href.split(":", 1)[1])
         except Exception:
             return
-        blocks = re.findall(r"```(?:\\w*)\\n(.*?)```", self._raw_text, flags=re.DOTALL)
+        blocks = re.findall(r"```(?:\w*)\n(.*?)```", self._raw_text, flags=re.DOTALL)
         if idx < 0 or idx >= len(blocks):
             return
         code = blocks[idx]
@@ -566,6 +765,76 @@ class ChatBubble(QFrame):
             QToolTip.showText(QCursor.pos(), "Copied", self)
         except Exception:
             pass
+
+    def _clear_segment_widgets(self):
+        self._segment_widgets = []
+        while self.segment_layout.count():
+            item = self.segment_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _build_text_segment(self, text: str) -> BubbleTextEdit:
+        edit = BubbleTextEdit(self._scroll_area, self.segment_wrap)
+        edit.link_clicked.connect(self._on_link_clicked)
+        edit.setFont(self.body.font())
+        edit.document().setDocumentMargin(4)
+        edit.setViewportMargins(0, 0, 0, 0)
+        edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        edit.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        edit.setStyleSheet(self.body.styleSheet())
+        edit.setHtml(md_chat_to_html(text, light=_is_light_theme()))
+        return edit
+
+    def _fit_text_segment(self, edit: BubbleTextEdit, width: int):
+        doc = edit.document()
+        text_width = max(100, width - 16)
+        doc.setTextWidth(float(text_width))
+        layout_size = doc.documentLayout().documentSize()
+        doc_size = doc.size()
+        base_h = max(float(layout_size.height()), float(doc_size.height()))
+        height = math.ceil(base_h) + 18
+        edit.setFixedHeight(int(max(height, 22)))
+
+    def _fit_segment_widgets(self, width: int):
+        for widget in self._segment_widgets:
+            if isinstance(widget, CodeBlockWidget):
+                widget.set_content_width(width)
+            elif isinstance(widget, BubbleTextEdit):
+                self._fit_text_segment(widget, width)
+        self.segment_wrap.updateGeometry()
+
+    def _render_assistant_content(self):
+        text = self._raw_text
+        has_code = bool(re.search(r"```(?:\w*)\n.*?```", text, flags=re.DOTALL))
+        self._clear_segment_widgets()
+        if not has_code:
+            self.segment_wrap.hide()
+            self.body.setVisible(bool(text.strip()))
+            self.body.setHtml(md_chat_to_html(text, light=_is_light_theme()))
+        else:
+            self.body.hide()
+            self.segment_wrap.setVisible(True)
+            for kind, content, lang in split_markdown_blocks(text):
+                if kind == "text":
+                    if not content.strip():
+                        continue
+                    widget = self._build_text_segment(content)
+                else:
+                    widget = CodeBlockWidget(content, lang, self._scroll_area, self.segment_wrap)
+                self._segment_widgets.append(widget)
+                self.segment_layout.addWidget(widget)
+            if not self._segment_widgets and text.strip():
+                fallback = self._build_text_segment(text)
+                self._segment_widgets.append(fallback)
+                self.segment_layout.addWidget(fallback)
+        # Fit layout, then scroll to bottom once layout is settled
+        def _fit_then_scroll():
+            self._fit()
+            if self._scroll_area:
+                sb = self._scroll_area.verticalScrollBar()
+                sb.setValue(sb.maximum())
+        QTimer.singleShot(0, _fit_then_scroll)
 
     def _render_attachments(self):
         while self.attachments_layout.count():
@@ -692,6 +961,15 @@ class NoWheelComboBox(QComboBox):
 
 
 class NoWheelFontComboBox(QFontComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMaxVisibleItems(10)
+        try:
+            self.view().setMinimumHeight(0)
+            self.view().setMaximumHeight(320)
+        except Exception:
+            pass
+
     def wheelEvent(self, event):
         event.ignore()
 
@@ -803,12 +1081,14 @@ class ContextRingWidget(QWidget):
         self._ratio: Optional[float] = None
         self._current = "—"
         self._limit = "—"
+        self._compression: Optional[str] = None  # None | "compressing" | "done"
         self._refresh_tip()
 
     def clear(self):
         self._ratio = None
         self._current = "—"
         self._limit = "—"
+        self._compression = None
         self._refresh_tip()
         self.update()
 
@@ -824,6 +1104,21 @@ class ContextRingWidget(QWidget):
         self._refresh_tip()
         self.update()
 
+    def set_compression_status(self, status: Optional[str]):
+        """设置压缩状态: None | 'compressing' | 'done'"""
+        self._compression = status
+        self._refresh_tip()
+        self.update()
+        # 压缩完成后 3 秒自动清除状态
+        if status == "done":
+            QTimer.singleShot(3000, self._clear_compression)
+
+    def _clear_compression(self):
+        if self._compression == "done":
+            self._compression = None
+            self._refresh_tip()
+            self.update()
+
     def _refresh_tip(self):
         self.setStyleSheet(_tooltip_css(_is_light_theme()))
         if self._ratio is None:
@@ -833,7 +1128,12 @@ class ContextRingWidget(QWidget):
             pct = int(round(self._ratio * 100))
         except Exception:
             pct = 0
-        self.setToolTip(f"上下文\n已用: {self._current}\n上限: {self._limit}\n占用: {pct}%")
+        tip = f"上下文\n已用: {self._current}\n上限: {self._limit}\n占用: {pct}%"
+        if self._compression == "compressing":
+            tip += "\n状态: ⏳ 正在压缩上下文..."
+        elif self._compression == "done":
+            tip += "\n状态: ✓ 压缩完成"
+        self.setToolTip(tip)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -871,3 +1171,20 @@ class ContextRingWidget(QWidget):
         inner = QRectF(rect.x() + inset, rect.y() + inset, rect.width() - 2 * inset, rect.height() - 2 * inset)
         span = int(r * 360 * 16)
         p.drawArc(inner, 90 * 16, -span)
+
+        # 压缩状态视觉指示
+        if self._compression == "compressing":
+            # 正在压缩：橙色虚线弧覆盖
+            pen_c = QPen(QColor("#f59e0b"))
+            pen_c.setWidthF(max(1.0, self._d * 0.08))
+            pen_c.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen_c.setStyle(Qt.PenStyle.DashLine)
+            p.setPen(pen_c)
+            p.drawArc(inner, 90 * 16, -int(360 * 16))
+        elif self._compression == "done":
+            # 压缩完成：绿色短弧标记
+            pen_c = QPen(QColor("#22c55e"))
+            pen_c.setWidthF(max(1.4, self._d * 0.13))
+            pen_c.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen_c)
+            p.drawArc(inner, 90 * 16, -int(60 * 16))

@@ -31,7 +31,7 @@ from config import (
 )
 import data_portability
 from chat_widgets import NoWheelComboBox, NoWheelFontComboBox, NoWheelSpinBox
-from theme import C_DIM, C_PANEL, C_PANEL_HI, C_TEXT
+from theme import C_DIM, C_PANEL, C_PANEL_HI, C_TEXT, build_combobox_stylesheet, build_checkbox_stylesheet
 
 
 class SettingsPage(QWidget):
@@ -71,7 +71,7 @@ class SettingsPage(QWidget):
             f"QListWidget::item{{padding:10px 12px;border-radius:10px;text-align:left;}}"
             f"QListWidget::item:selected{{background:{self._panel_hi};color:{self._txt}}}"
         )
-        for item in ("外观", "模型与API", "IDE", "Agent"):
+        for item in ("外观", "模型与API", "IDE", "Agent", "扩展"):
             self.nav.addItem(QListWidgetItem(item))
         self.nav.setCurrentRow(0)
         nav_l.addWidget(self.nav, 1)
@@ -98,6 +98,7 @@ class SettingsPage(QWidget):
         self._build_model_api_page()
         self._build_ide_page()
         self._build_agent_page()
+        self._build_extension_page()
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
         self._apply_page_theme()
         self.reload_from_config()
@@ -116,7 +117,10 @@ class SettingsPage(QWidget):
         c_hover = "#e7e8e8" if self._light else "#313131"
         c_select_bg = "#cce8ff" if self._light else "#264f78"
         c_select_fg = "#1e1e1e" if self._light else "#ffffff"
-        c_popup_bg = "#ffffff" if self._light else "#2d2d2d"
+        checkbox_css = build_checkbox_stylesheet(
+            "light" if self._light else "dark",
+            str(getattr(self.cfg, "accent_color", "#5ee9ff") or "#5ee9ff"),
+        )
         self.setStyleSheet(
             f"QWidget#SettingsPage{{background:{c_bg};}}"
             f"QFrame#settingsNavWrap{{background:{'#f5f5f5' if self._light else '#202020'};border:none;}}"
@@ -125,10 +129,7 @@ class SettingsPage(QWidget):
             f"selection-background-color:{c_select_bg};selection-color:{c_select_fg};}}"
             f"QLineEdit:focus,QSpinBox:focus{{border:none;outline:none;}}"
             f"QLineEdit:disabled,QSpinBox:disabled{{color:{'#9ca3af' if self._light else '#6b7280'};background:transparent;}}"
-            f"QCheckBox{{color:{c_fg};font-size:13px;spacing:8px;}}"
-            f"QCheckBox::indicator{{width:16px;height:16px;border-radius:8px;border:1px solid {c_border};background:{c_card};}}"
-            f"QCheckBox::indicator:checked{{background:#007acc;border:1px solid #007acc;}}"
-            f"QCheckBox:disabled{{color:{'#9ca3af' if self._light else '#6b7280'};}}"
+            f"{checkbox_css}"
             f"QPushButton:disabled{{color:{'#9ca3af' if self._light else '#6b7280'};}}"
             f"QListWidget{{background:transparent;border:none;outline:none;color:{c_fg};}}"
             f"QListWidget::item:hover{{background:{c_hover};}}"
@@ -149,7 +150,7 @@ class SettingsPage(QWidget):
                 f"QListWidget::item:hover{{background:{c_hover};color:{c_fg};}}"
                 f"QListWidget::item:selected{{background:{c_select_bg};color:{c_select_fg};}}"
             )
-        for btn_name in ("add_btn", "del_btn", "set_active_btn", "monaco_check_btn", "monaco_install_btn"):
+        for btn_name in ("add_btn", "del_btn", "set_active_btn", "monaco_check_btn", "monaco_install_btn", "ext_open_dir_btn", "ext_status_btn"):
             if hasattr(self, btn_name):
                 getattr(self, btn_name).setStyleSheet(
                     _with_tooltip_style(
@@ -174,21 +175,9 @@ class SettingsPage(QWidget):
             self._refresh_monaco_dependency_ui()
 
     def _style_combo(self, combo: QComboBox):
-        c_fg = "#4f5153" if self._light else "#ffffff"
-        c_hover = "#e7e8e8" if self._light else "#313131"
-        c_select_bg = "#cce8ff" if self._light else "#264f78"
-        c_select_fg = "#1e1e1e" if self._light else "#ffffff"
-        c_popup_bg = "#ffffff" if self._light else "#2d2d2d"
         combo.setMaxVisibleItems(12)
         combo.setEditable(False)
-        combo.setStyleSheet(
-            f"QComboBox{{background:transparent;color:{c_fg};border:none;border-radius:0;min-height:30px;padding:0 2px;font-size:13px;selection-background-color:{c_select_bg};selection-color:{c_select_fg};}}"
-            "QComboBox:focus{border:none;outline:none;}"
-            "QComboBox::drop-down{border:none;width:18px;background:transparent;}"
-            f"QComboBox QAbstractItemView{{background:{c_popup_bg};color:{c_fg};border:none;selection-background-color:{c_select_bg};selection-color:{c_select_fg};outline:none;}}"
-            f"QComboBox QAbstractItemView::item{{background:{c_popup_bg};color:{c_fg};min-height:24px;padding:2px 8px;}}"
-            f"QComboBox QAbstractItemView::item:hover{{background:{c_hover};color:{c_fg};}}"
-        )
+        combo.setStyleSheet(build_combobox_stylesheet("light" if self._light else "dark"))
 
     def _make_size_combo(self, values: list[int]) -> NoWheelComboBox:
         combo = NoWheelComboBox()
@@ -317,8 +306,10 @@ class SettingsPage(QWidget):
         self.theme_combo = NoWheelComboBox()
         self.theme_combo.addItems(["dark", "light"])
         self.ui_font_combo = NoWheelFontComboBox()
+        self.ui_font_combo.setMaxVisibleItems(10)
         self.ui_font_size = self._make_size_combo(list(range(9, 21)))
         self.code_font_combo = NoWheelFontComboBox()
+        self.code_font_combo.setMaxVisibleItems(10)
         self.code_font_size = self._make_size_combo(list(range(10, 25)))
         self.accent_btn = QPushButton()
         self.accent_btn.clicked.connect(self._pick_accent_color)
@@ -526,6 +517,120 @@ class SettingsPage(QWidget):
         v.addStretch(1)
         self._add_scroll_page(page)
 
+    def _build_extension_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+
+        # Browser extension group
+        box, form = self._make_group("浏览器扩展", "通过 Chrome 扩展实现浏览器自动化，复用已登录的浏览器会话")
+
+        self.feature_browser_tools = QCheckBox("启用浏览器工具")
+        self._add_setting_card(form, "浏览器工具", "开启后 Agent 可通过 Chrome 扩展操控浏览器（导航、点击、执行 JS 等）。需要安装配套扩展。", self.feature_browser_tools,
+            help_text="开启后：Agent 的工具列表里会多出 web_scan 和 web_execute_js，可以通过 Chrome 扩展操控你的浏览器。需要先安装配套的 CDP Bridge 扩展。")
+
+        # Extension status and install section
+        ext_card = QFrame()
+        ext_card.setStyleSheet("QFrame{background:transparent;border:none}")
+        ext_cl = QVBoxLayout(ext_card)
+        ext_cl.setContentsMargins(0, 0, 0, 0)
+        ext_cl.setSpacing(8)
+
+        ext_title = QLabel("CDP Bridge 扩展")
+        ext_title.setStyleSheet(f"font-size:13px;font-weight:500;color:{self._txt};background:transparent")
+        ext_cl.addWidget(ext_title)
+
+        ext_desc = QLabel("用于连接 Agent 和浏览器的 Chrome 扩展。安装后扩展会自动连接到本地 WebSocket 服务器。")
+        ext_desc.setWordWrap(True)
+        ext_desc.setStyleSheet(f"font-size:11px;color:{self._dim};background:transparent")
+        ext_cl.addWidget(ext_desc)
+
+        # Extension status
+        self.ext_status_label = QLabel()
+        self.ext_status_label.setStyleSheet(f"font-size:12px;background:transparent;")
+        ext_cl.addWidget(self.ext_status_label)
+
+        # Buttons row
+        btn_row = QWidget()
+        btn_row.setStyleSheet("background:transparent")
+        btn_l = QHBoxLayout(btn_row)
+        btn_l.setContentsMargins(0, 0, 0, 0)
+        btn_l.setSpacing(8)
+
+        self.ext_open_dir_btn = QPushButton("打开扩展目录")
+        self.ext_open_dir_btn.setToolTip("在文件管理器中打开扩展所在目录，然后拖入浏览器扩展页面安装")
+        self.ext_open_dir_btn.clicked.connect(self._open_extension_dir)
+        btn_l.addWidget(self.ext_open_dir_btn)
+
+        self.ext_status_btn = QPushButton("检查连接状态")
+        self.ext_status_btn.setToolTip("检查浏览器扩展是否已连接")
+        self.ext_status_btn.clicked.connect(self._check_extension_status)
+        btn_l.addWidget(self.ext_status_btn)
+
+        btn_l.addStretch(1)
+        ext_cl.addWidget(btn_row)
+
+        # Install instructions
+        instructions = QLabel(
+            "安装步骤：\n"
+            "1. 点击「打开扩展目录」按钮\n"
+            "2. 打开浏览器的扩展管理页面（Chrome: chrome://extensions，Edge: edge://extensions）\n"
+            "3. 开启「开发者模式」\n"
+            "4. 将扩展目录拖入浏览器窗口，或点击「加载已解压的扩展程序」选择目录"
+        )
+        instructions.setWordWrap(True)
+        border = "#d7dbe2" if self._light else "#2f3238"
+        instructions.setStyleSheet(
+            f"font-size:11px;color:{self._dim};background:{'#f8f9fa' if self._light else '#1a1a1a'};"
+            f"border:1px solid {border};border-radius:8px;padding:10px 12px;"
+        )
+        ext_cl.addWidget(instructions)
+
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background:{'#d7dbe2' if self._light else '#2f3238'};border:none;")
+        ext_cl.addSpacing(4)
+        ext_cl.addWidget(sep)
+        form.addWidget(ext_card)
+
+        v.addWidget(box)
+        v.addStretch(1)
+        self._add_scroll_page(page)
+
+    def _open_extension_dir(self):
+        ext_dir = Path(__file__).parent / "assets" / "tmwd_cdp_bridge"
+        if not ext_dir.exists():
+            from PyQt6.QtWidgets import QToolTip
+            QToolTip.showText(self.mapToGlobal(self.rect().center()), "扩展目录不存在", self)
+            return
+        import subprocess, sys
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", str(ext_dir)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(ext_dir)])
+        else:
+            subprocess.Popen(["xdg-open", str(ext_dir)])
+
+    def _check_extension_status(self):
+        try:
+            from browser_driver import get_browser_driver
+            driver = get_browser_driver()
+            if driver.is_running and driver.has_connection:
+                tabs = driver.connected_tabs
+                tab_info = ", ".join(f"{t['title'][:30]}" for t in tabs[:3])
+                self.ext_status_label.setText(f"已连接 — {len(tabs)} 个标签页: {tab_info}")
+                self.ext_status_label.setStyleSheet(f"color:{'#0f766e' if self._light else '#5eead4'};font-size:12px;background:transparent;")
+            elif driver.is_running:
+                self.ext_status_label.setText("服务运行中 — 等待扩展连接...")
+                self.ext_status_label.setStyleSheet(f"color:{'#b45309' if self._light else '#fbbf24'};font-size:12px;background:transparent;")
+            else:
+                self.ext_status_label.setText("服务未启动 — 请先启用浏览器工具")
+                self.ext_status_label.setStyleSheet(f"color:{'#b45309' if self._light else '#fbbf24'};font-size:12px;background:transparent;")
+        except ImportError:
+            self.ext_status_label.setText("browser_driver 模块不可用")
+            self.ext_status_label.setStyleSheet(f"color:{'#dc2626' if self._light else '#f87171'};font-size:12px;background:transparent;")
+
     def _export_local_data(self):
         try:
             path, _ = QFileDialog.getSaveFileName(self, "导出本地数据", str(Path(__file__).parent / "kscc-data.zip"), "Zip (*.zip)")
@@ -647,6 +752,7 @@ class SettingsPage(QWidget):
         self.feature_risk_templates.setChecked(bool(getattr(cfg, "feature_risk_templates", True)))
         self.feature_evidence_capture.setChecked(bool(getattr(cfg, "feature_evidence_capture", True)))
         self.feature_adb_tools.setChecked(bool(getattr(cfg, "feature_adb_tools", False)))
+        self.feature_browser_tools.setChecked(bool(getattr(cfg, "feature_browser_tools", False)))
         self.ide_font_size.setCurrentText(str(int(getattr(cfg, "ide_font_size", 13))))
         for combo in (self.theme_combo, self.ui_font_combo, self.ui_font_size, self.code_font_combo, self.code_font_size, self.ide_font_size):
             self._style_combo(combo)
@@ -811,6 +917,7 @@ class SettingsPage(QWidget):
         self.cfg.feature_risk_templates = self.feature_risk_templates.isChecked()
         self.cfg.feature_evidence_capture = self.feature_evidence_capture.isChecked()
         self.cfg.feature_adb_tools = self.feature_adb_tools.isChecked()
+        self.cfg.feature_browser_tools = self.feature_browser_tools.isChecked()
         self.cfg.ide_font_size = int(self.ide_font_size.currentText() or 13)
         if self.cfg.openai_active and not any(m.name == self.cfg.openai_active and m.enabled for m in self.cfg.openai_models):
             enabled = [m for m in self.cfg.openai_models if m.enabled]

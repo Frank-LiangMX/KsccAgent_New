@@ -35,6 +35,15 @@ _MODE_DESCRIPTIONS = {
     "ide": "你在 IDE 审阅模式下工作。进行文件修改前先说明计划并调用工具，由用户逐步批准或拒绝。只读类操作可直接执行。",
 }
 
+_BROWSER_TOOL_GUIDANCE = """
+## 浏览器工具（已连接用户的真实浏览器）
+你的 web_scan 和 web_execute_js 工具可以操控用户 Chrome 浏览器中已打开的页面。
+- 当用户要求查看/操作当前网页、点击按钮、填写表单、提取页面数据时，优先使用 web_scan / web_execute_js。
+- web_fetch 是服务端 HTTP 请求（无 JS 渲染、无登录态），仅用于抓取公开文档和 API。需要登录态或 JS 渲染的页面必须用 web_scan。
+- 如果浏览器扩展未连接，先用 web_launch 启动 Chrome 并等待扩展连接。
+- 如果扩展已连接但没有可用标签页，用 web_open 打开一个新标签页。
+- 使用 web_scan 先了解页面内容，再用 web_execute_js 执行交互操作。"""
+
 SYSTEM_PROMPT = """你是 Kscc，一名 AI 编程助手，帮助用户完成软件工程任务。
 
 ## 你的能力
@@ -43,6 +52,7 @@ SYSTEM_PROMPT = """你是 Kscc，一名 AI 编程助手，帮助用户完成软�
 - 使用正则搜索代码
 - 使用 glob 查找文件
 - 列出目录内容
+- 搜索外部 Skill 库（105K+ 技能卡）：当本地没有现成经验时，使用 skill_search 工具从外部库中查找可复用的 Skill/SOP。查询必须使用英文关键词。
 
 ## 行为准则
 - 回复简洁直接，不要冗余前言。
@@ -177,7 +187,7 @@ TOOLS_OPENAI = [
         "type": "function",
         "function": {
             "name": "web_fetch",
-            "description": "Fetches content from a URL and returns as markdown/text. Use for reading documentation, API docs, etc.",
+            "description": "Server-side HTTP fetch (no JS rendering, no cookies/login). Use ONLY for public documentation or API endpoints. For pages requiring login or JS rendering, use web_scan instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -199,6 +209,84 @@ TOOLS_OPENAI = [
                     "device": {"type": "string", "description": "Optional device serial number when multiple devices are connected"},
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_scan",
+            "description": "Read the user's real browser tab (with full JS rendering and login state). Returns page URL, title, and simplified DOM. Use this to see what the user sees in Chrome. Supports tab listing and switching.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tabs_only": {"type": "boolean", "description": "Show tab list only, no page content"},
+                    "switch_tab_id": {"type": "string", "description": "Tab ID to switch to before scanning"},
+                    "text_only": {"type": "boolean", "description": "Get plain text only, no HTML tags"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_execute_js",
+            "description": "Execute JavaScript in the user's real browser tab. Use for clicking buttons, filling forms, scrolling, extracting data, or any page interaction. Has full access to the page DOM and APIs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script": {"type": "string", "description": "JavaScript code to execute"},
+                    "switch_tab_id": {"type": "string", "description": "Tab ID to switch to before executing"},
+                    "no_monitor": {"type": "boolean", "description": "Skip page change monitoring (faster, for read-only operations)"},
+                    "save_to_file": {"type": "string", "description": "Save the result to a file path (for large results)"},
+                },
+                "required": ["script"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_launch",
+            "description": "Launch Chrome browser and connect via CDP Bridge extension. Use this FIRST when the user wants to browse the web but Chrome may not be running. Automatically detects if Chrome is already running. After launch, use web_open/web_scan/web_execute_js to interact with pages.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to open after launching (e.g., 'https://www.baidu.com'). Optional - if omitted, just launches Chrome."},
+                    "timeout": {"type": "integer", "description": "Max seconds to wait for extension connection (default: 30)"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_open",
+            "description": "Open a new tab in the user's Chrome browser. Use this when no suitable tab is open or you need to navigate to a new URL. The tab will be automatically registered for web_scan/web_execute_js.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to open (e.g., 'https://www.baidu.com')"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_search",
+            "description": "Search an external skill library (105K+ skill cards) for reusable skills/SOPs matching the user's need. Use this when no local skill matches and the user wants to find external expertise. Queries MUST be in English for best results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "English search keywords describing the needed skill (e.g., 'python send email', 'docker deployment')"},
+                    "category": {"type": "string", "description": "Optional category filter (e.g., 'devops', 'web', 'data')"},
+                    "top_k": {"type": "integer", "description": "Number of results to return (default 5)"},
+                },
+                "required": ["query"],
             },
         },
     },
@@ -312,6 +400,69 @@ TOOLS_ANTHROPIC = [
                 "device": {"type": "string", "description": "Optional device serial number when multiple devices are connected"},
             },
             "required": ["command"],
+        },
+    },
+    {
+        "name": "web_scan",
+        "description": "Read the user's real browser tab (with full JS rendering and login state). Returns page URL, title, and simplified DOM. Use this to see what the user sees in Chrome. Supports tab listing and switching.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tabs_only": {"type": "boolean", "description": "Show tab list only, no page content"},
+                "switch_tab_id": {"type": "string", "description": "Tab ID to switch to before scanning"},
+                "text_only": {"type": "boolean", "description": "Get plain text only, no HTML tags"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "web_execute_js",
+        "description": "Execute JavaScript in the user's real browser tab. Use for clicking buttons, filling forms, scrolling, extracting data, or any page interaction. Has full access to the page DOM and APIs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "script": {"type": "string", "description": "JavaScript code to execute"},
+                "switch_tab_id": {"type": "string", "description": "Tab ID to switch to before executing"},
+                "no_monitor": {"type": "boolean", "description": "Skip page change monitoring (faster, for read-only operations)"},
+                "save_to_file": {"type": "string", "description": "Save the result to a file path (for large results)"},
+            },
+            "required": ["script"],
+        },
+    },
+    {
+        "name": "web_launch",
+        "description": "Launch Chrome browser and connect via CDP Bridge extension. Use this FIRST when the user wants to browse the web but Chrome may not be running. Automatically detects if Chrome is already running. After launch, use web_open/web_scan/web_execute_js to interact with pages.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to open after launching (e.g., 'https://www.baidu.com'). Optional - if omitted, just launches Chrome."},
+                "timeout": {"type": "integer", "description": "Max seconds to wait for extension connection (default: 30)"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "web_open",
+        "description": "Open a new tab in the user's Chrome browser. Use this when no suitable tab is open or you need to navigate to a new URL. The tab will be automatically registered for web_scan/web_execute_js.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to open (e.g., 'https://www.baidu.com')"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "skill_search",
+        "description": "Search an external skill library (105K+ skill cards) for reusable skills/SOPs matching the user's need. Use this when no local skill matches and the user wants to find external expertise. Queries MUST be in English for best results.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "English search keywords describing the needed skill (e.g., 'python send email', 'docker deployment')"},
+                "category": {"type": "string", "description": "Optional category filter (e.g., 'devops', 'web', 'data')"},
+                "top_k": {"type": "integer", "description": "Number of results to return (default 5)"},
+            },
+            "required": ["query"],
         },
     },
 ]
@@ -431,17 +582,23 @@ class Agent:
             if not any(m.get("role") == "system" for m in self.messages):
                 mode_desc = _MODE_DESCRIPTIONS.get(self.mode, _MODE_DESCRIPTIONS["ide"])
                 system = SYSTEM_PROMPT.format(mode_description=mode_desc, workspace=self.config.workspace)
+                if bool(getattr(self.config, "feature_browser_tools", False)):
+                    system += _BROWSER_TOOL_GUIDANCE
                 if bool(getattr(self.config, "memory_injection_enabled", True)):
-                    mem = memory_store.build_injection_text(task_types=task_types, query=effective_prompt)
+                    mem = memory_store.build_injection_text(task_types=task_types, query=effective_prompt, exclude_session_ids=getattr(self.config, "_exclude_session_ids", None))
                     if mem.strip():
                         system += "\n\n## Local memory (auto)\n" + mem
                 self.messages.insert(0, {"role": "system", "content": system})
+            # 清理历史中的孤立 tool 消息
+            self.messages = self._sanitize_messages(self.messages)
             self.messages.append({"role": "user", "content": self._build_user_content(effective_prompt, attachments)})
         else:
             mode_desc = _MODE_DESCRIPTIONS.get(self.mode, _MODE_DESCRIPTIONS["ide"])
             system = SYSTEM_PROMPT.format(mode_description=mode_desc, workspace=self.config.workspace)
+            if bool(getattr(self.config, "feature_browser_tools", False)):
+                system += _BROWSER_TOOL_GUIDANCE
             if bool(getattr(self.config, "memory_injection_enabled", True)):
-                mem = memory_store.build_injection_text(task_types=task_types, query=effective_prompt)
+                mem = memory_store.build_injection_text(task_types=task_types, query=effective_prompt, exclude_session_ids=getattr(self.config, "_exclude_session_ids", None))
                 if mem.strip():
                     system += "\n\n## Local memory (auto)\n" + mem
             self.messages = [{"role": "system", "content": system}]
@@ -450,7 +607,7 @@ class Agent:
         # P3-5: Yield memory hit metadata for UI visualization
         if bool(getattr(self.config, "memory_injection_enabled", True)):
             try:
-                hits = memory_store.get_injection_hits(task_types=task_types, query=effective_prompt)
+                hits = memory_store.get_injection_hits(task_types=task_types, query=effective_prompt, exclude_session_ids=getattr(self.config, "_exclude_session_ids", None))
                 if any(hits.get(k, 0) > 0 for k in ("rules_count", "facts_count", "insights_count", "archives_count")):
                     yield {"type": "memory_hits", "hits": hits}
             except Exception:
@@ -756,6 +913,18 @@ class Agent:
             f"{extra}"
         )
 
+    @staticmethod
+    def strip_skill_augmentation(content) -> str:
+        """Strip skill augmentation markers from user message content for display."""
+        if not content or not isinstance(content, str):
+            return content if content else ""
+        # Remove everything from the first skill marker to the end
+        for marker in ("[已匹配本地技能", "[其他高相似技能", "[建议步骤]", "[回放序列]"):
+            idx = content.find(marker)
+            if idx > 0:
+                return content[:idx].rstrip()
+        return content
+
     def _collect_tool_names_from_messages(self) -> list[str]:
         seen: list[str] = []
         for m in self.messages:
@@ -872,6 +1041,19 @@ class Agent:
         head = body[:-keep]
         tail = body[-keep:]
 
+        # 保留 head 中的 user 消息，避免 trim 后 session 丢失用户输入（最多保留最近 10 条）
+        preserved_user_msgs = [m for m in head if m.get("role") == "user"][-10:]
+
+        # 清理 tail 中的孤立 tool 消息（对应的 assistant+tool_calls 可能被裁到 head 里了）
+        valid_tc_ids: set[str] = set()
+        for m in tail:
+            if m.get("role") == "assistant":
+                for tc in m.get("tool_calls", []):
+                    tc_id = tc.get("id", "")
+                    if tc_id:
+                        valid_tc_ids.add(tc_id)
+        tail = [m for m in tail if m.get("role") != "tool" or m.get("tool_call_id", "") in valid_tc_ids]
+
         def _msg_text(msg: dict) -> str:
             c = msg.get("content", "")
             if isinstance(c, str):
@@ -907,6 +1089,8 @@ class Agent:
         new_msgs = [system]
         if anchor:
             new_msgs.append({"role": "system", "content": anchor})
+        # 将被裁掉的 user 消息插回，保持 session 完整性
+        new_msgs.extend(preserved_user_msgs)
         new_msgs.extend(tail)
         old_count = len(self.messages) - len(new_msgs)
         self.messages = new_msgs
@@ -917,3 +1101,15 @@ class Agent:
     def _trim_messages(self):
         """已废弃，由 _trim_conversation 替代。"""
         self._trim_conversation()
+
+    @staticmethod
+    def _sanitize_messages(messages: list[dict]) -> list[dict]:
+        """移除孤立的 tool 消息（没有对应 assistant+tool_calls 的 tool 结果）。"""
+        valid_tc_ids: set[str] = set()
+        for m in messages:
+            if m.get("role") == "assistant":
+                for tc in m.get("tool_calls", []):
+                    tc_id = tc.get("id", "")
+                    if tc_id:
+                        valid_tc_ids.add(tc_id)
+        return [m for m in messages if m.get("role") != "tool" or m.get("tool_call_id", "") in valid_tc_ids]

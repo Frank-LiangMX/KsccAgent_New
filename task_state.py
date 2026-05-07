@@ -32,7 +32,6 @@ class TaskPhase(Enum):
     """任务执行阶段"""
     PLANNING = "planning"        # 计划阶段
     EXECUTING = "executing"      # 执行阶段
-    REFLECTING = "reflecting"    # 反思阶段
     COMPLETED = "completed"      # 任务完成
     FAILED = "failed"            # 任务失败
 
@@ -199,6 +198,24 @@ class TaskState:
     def has_pending_steps(self) -> bool:
         """检查是否有待执行的步骤"""
         return any(s.status == StepStatus.PENDING for s in self.steps)
+
+    def prepare_for_resume(self) -> dict:
+        """
+        准备任务恢复：将失败/跳过的步骤重置为 PENDING，保留已完成的步骤。
+        返回恢复摘要。
+        """
+        reset_count = 0
+        kept_count = 0
+        for step in self.steps:
+            if step.status in (StepStatus.FAILED, StepStatus.SKIPPED):
+                step.status = StepStatus.PENDING
+                step.retry_count = 0
+                reset_count += 1
+            elif step.status == StepStatus.SUCCESS:
+                kept_count += 1
+        self.phase = TaskPhase.EXECUTING
+        self.updated_at = time.time()
+        return {"reset": reset_count, "kept": kept_count}
 
     def progress(self) -> dict:
         """获取任务进度"""

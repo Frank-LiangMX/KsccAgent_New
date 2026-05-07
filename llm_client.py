@@ -32,12 +32,13 @@ class OpenAIBackend:
         body = {
             "model": self.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": max_tokens,
         }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
         url = f"{self.base_url}/chat/completions"
         async with httpx.AsyncClient(timeout=httpx.Timeout(300)) as client:
             async with client.stream("POST", url, json=body, headers=self.headers) as resp:
@@ -110,10 +111,11 @@ class AnthropicBackend:
         body = {
             "model": self.model,
             "messages": anthropic_messages,
-            "tools": tools,
             "stream": True,
             "max_tokens": max_tokens,
         }
+        if tools:
+            body["tools"] = tools
         if system.strip():
             body["system"] = system.strip()
 

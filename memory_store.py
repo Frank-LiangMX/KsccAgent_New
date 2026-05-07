@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -28,6 +29,9 @@ MEMORY_DIR = Path(__file__).parent / "memory"
 RULES_FILE = MEMORY_DIR / "rules.json"
 FACTS_FILE = MEMORY_DIR / "facts.json"
 ARCHIVES_FILE = MEMORY_DIR / "archives.jsonl"
+
+# Thread lock for concurrent write safety (multi-worker)
+_write_lock = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -68,10 +72,11 @@ def load_facts() -> list[dict[str, Any]]:
         return []
 
 
-def load_recent_archives(limit: int = 5) -> list[dict[str, Any]]:
+def load_recent_archives(limit: int = 5, exclude_session_ids: Optional[list[str]] = None) -> list[dict[str, Any]]:
     _ensure_dir()
     if not ARCHIVES_FILE.exists():
         return []
+    exclude = set(exclude_session_ids or [])
     lines = []
     try:
         raw = ARCHIVES_FILE.read_text("utf-8").splitlines()
@@ -80,7 +85,10 @@ def load_recent_archives(limit: int = 5) -> list[dict[str, Any]]:
             if not line:
                 continue
             try:
-                lines.append(json.loads(line))
+                entry = json.loads(line)
+                if exclude and entry.get("session_id", "") in exclude:
+                    continue
+                lines.append(entry)
             except json.JSONDecodeError:
                 continue
         return lines[-limit:] if limit else lines
@@ -95,6 +103,7 @@ def build_injection_text(
     max_chars: int = 4000,
     task_types: Optional[list[str]] = None,
     query: str = "",
+    exclude_session_ids: Optional[list[str]] = None,
 ) -> str:
     """Compact text block for system prompt.
 
@@ -139,7 +148,7 @@ def build_injection_text(
                 parts.append(f"- {text}{tag_str}")
 
     # Archives (P3-2: filter by task type if provided)
-    archives = load_recent_archives(archives_limit * 2 if task_types else archives_limit)
+    archives = load_recent_archives(archives_limit * 2 if task_types else archives_limit, exclude_session_ids=exclude_session_ids)
     if task_types:
         # Filter archives by matching task type keywords
         archives = _filter_archives_by_type(archives, task_types)[:archives_limit]
@@ -163,6 +172,7 @@ def get_injection_hits(
     rules_limit: int = 12,
     facts_limit: int = 8,
     archives_limit: int = 5,
+    exclude_session_ids: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """P3-5: Return metadata about what memory was injected.
 
@@ -178,7 +188,7 @@ def get_injection_hits(
     else:
         insights = load_insights(limit=5)
 
-    archives = load_recent_archives(archives_limit * 2 if task_types else archives_limit)
+    archives = load_recent_archives(archives_limit * 2 if task_types else archives_limit, exclude_session_ids=exclude_session_ids)
     if task_types:
         archives = _filter_archives_by_type(archives, task_types)[:archives_limit]
 
@@ -231,52 +241,53 @@ def compress_old_archives(days_threshold: int = 14, max_per_day: int = 2) -> dic
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_threshold)
     cutoff_str = cutoff.isoformat()
 
-    all_lines = []
-    old_lines = []
-    new_lines = []
+    with _write_lock:
+        all_lines = []
+        old_lines = []
+        new_lines = []
 
-    try:
-        raw = ARCHIVES_FILE.read_text("utf-8").splitlines()
-        for line in raw:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-                ts = entry.get("ts", "")
-                if ts and ts < cutoff_str:
-                    old_lines.append(entry)
-                else:
-                    new_lines.append(entry)
-            except json.JSONDecodeError:
-                continue
-    except Exception:
-        return {"compressed": 0, "kept": 0, "error": "read failed"}
+        try:
+            raw = ARCHIVES_FILE.read_text("utf-8").splitlines()
+            for line in raw:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    ts = entry.get("ts", "")
+                    if ts and ts < cutoff_str:
+                        old_lines.append(entry)
+                    else:
+                        new_lines.append(entry)
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            return {"compressed": 0, "kept": 0, "error": "read failed"}
 
-    if not old_lines:
-        return {"compressed": 0, "kept": len(new_lines)}
+        if not old_lines:
+            return {"compressed": 0, "kept": len(new_lines)}
 
-    # Group old archives by date
-    by_date: dict[str, list[dict]] = {}
-    for entry in old_lines:
-        ts = entry.get("ts", "")
-        date_key = ts[:10] if len(ts) >= 10 else "unknown"
-        by_date.setdefault(date_key, []).append(entry)
+        # Group old archives by date
+        by_date: dict[str, list[dict]] = {}
+        for entry in old_lines:
+            ts = entry.get("ts", "")
+            date_key = ts[:10] if len(ts) >= 10 else "unknown"
+            by_date.setdefault(date_key, []).append(entry)
 
-    # Keep top N per day, compress rest
-    kept_old = []
-    compressed_count = 0
-    for date_key, entries in by_date.items():
-        entries.sort(key=lambda e: -int(e.get("turns", 0)))
-        kept_old.extend(entries[:max_per_day])
-        compressed_count += max(0, len(entries) - max_per_day)
+        # Keep top N per day, compress rest
+        kept_old = []
+        compressed_count = 0
+        for date_key, entries in by_date.items():
+            entries.sort(key=lambda e: -int(e.get("turns", 0)))
+            kept_old.extend(entries[:max_per_day])
+            compressed_count += max(0, len(entries) - max_per_day)
 
-    # Rewrite archives file
-    all_entries = kept_old + new_lines
-    all_entries.sort(key=lambda e: e.get("ts", ""))
-    with open(ARCHIVES_FILE, "w", encoding="utf-8") as f:
-        for entry in all_entries:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        # Rewrite archives file
+        all_entries = kept_old + new_lines
+        all_entries.sort(key=lambda e: e.get("ts", ""))
+        with open(ARCHIVES_FILE, "w", encoding="utf-8") as f:
+            for entry in all_entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     return {
         "compressed": compressed_count,
@@ -342,16 +353,17 @@ def detect_fact_conflicts() -> list[dict[str, Any]]:
 def remove_fact(index: int) -> bool:
     """Remove a fact by index. Used for conflict resolution."""
     _ensure_dir()
-    try:
-        data = json.loads(FACTS_FILE.read_text("utf-8"))
-    except Exception:
-        return False
-    facts = list(data.get("facts", []))
-    if 0 <= index < len(facts):
-        facts.pop(index)
-        data["facts"] = facts
-        FACTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-        return True
+    with _write_lock:
+        try:
+            data = json.loads(FACTS_FILE.read_text("utf-8"))
+        except Exception:
+            return False
+        facts = list(data.get("facts", []))
+        if 0 <= index < len(facts):
+            facts.pop(index)
+            data["facts"] = facts
+            FACTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+            return True
     return False
 
 
@@ -387,15 +399,16 @@ def add_rule(text: str) -> bool:
     if not text:
         return False
     _ensure_dir()
-    try:
-        data = json.loads(RULES_FILE.read_text("utf-8"))
-    except Exception:
-        data = {"rules": []}
-    rules = list(data.get("rules", []))
-    if text not in rules:
-        rules.append(text)
-    data["rules"] = rules
-    RULES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    with _write_lock:
+        try:
+            data = json.loads(RULES_FILE.read_text("utf-8"))
+        except Exception:
+            data = {"rules": []}
+        rules = list(data.get("rules", []))
+        if text not in rules:
+            rules.append(text)
+        data["rules"] = rules
+        RULES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
     return True
 
 
@@ -404,12 +417,13 @@ def add_fact(text: str, source: str = "") -> bool:
     if not text:
         return False
     _ensure_dir()
-    try:
-        data = json.loads(FACTS_FILE.read_text("utf-8"))
-    except Exception:
-        data = {"facts": []}
-    facts = list(data.get("facts", []))
-    facts.append({"text": text, "source": (source or "").strip()})
-    data["facts"] = facts[-500:]
-    FACTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    with _write_lock:
+        try:
+            data = json.loads(FACTS_FILE.read_text("utf-8"))
+        except Exception:
+            data = {"facts": []}
+        facts = list(data.get("facts", []))
+        facts.append({"text": text, "source": (source or "").strip()})
+        data["facts"] = facts[-500:]
+        FACTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
     return True

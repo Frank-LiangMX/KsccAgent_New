@@ -3,3 +3,5 @@ python-dotenv>=1.0.0
 tiktoken>=0.7.0
 PyQt6>=6.6.0
 PyQt6-WebEngine>=6.6.0
+pygments>=2.17.0
+simple-websocket-server>=0.1.0

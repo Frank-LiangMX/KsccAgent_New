@@ -125,6 +125,33 @@ register_tool(ToolMeta(
     ],
 ))
 
+# Browser automation tools (CDP Bridge)
+register_tool(ToolMeta(
+    name="web_scan", category=ToolCategory.WEB, risk=RiskLevel.MEDIUM,
+    read_only=True, needs_workspace=False,
+    description="获取浏览器页面内容和标签页列表",
+))
+register_tool(ToolMeta(
+    name="web_execute_js", category=ToolCategory.WEB, risk=RiskLevel.HIGH,
+    read_only=False, needs_workspace=False,
+    description="在浏览器中执行 JavaScript 代码",
+))
+register_tool(ToolMeta(
+    name="web_open", category=ToolCategory.WEB, risk=RiskLevel.MEDIUM,
+    read_only=False, needs_workspace=False,
+    description="在浏览器中打开新标签页",
+))
+register_tool(ToolMeta(
+    name="web_launch", category=ToolCategory.WEB, risk=RiskLevel.MEDIUM,
+    read_only=False, needs_workspace=False,
+    description="启动 Chrome 浏览器并连接扩展",
+))
+register_tool(ToolMeta(
+    name="skill_search", category=ToolCategory.API, risk=RiskLevel.SAFE,
+    read_only=True, needs_workspace=False,
+    description="搜索外部 Skill 库（105K+ 技能卡）",
+))
+
 # P4-5: 敏感任务风控模板
 RISK_TEMPLATES: dict[str, dict] = {
     "payment": {
@@ -298,6 +325,17 @@ class ToolExecutor:
                 if not (getattr(self._config, 'feature_adb_tools', False) if self._config else False):
                     return "ToolError: ADB 工具已禁用。请在设置 > Agent > 实验特性中开启。"
                 dispatch["adb_command"] = self._adb_command
+            # Browser tools gated behind feature flag
+            if name in ("web_scan", "web_execute_js", "web_open", "web_launch"):
+                if not (getattr(self._config, 'feature_browser_tools', False) if self._config else False):
+                    return "ToolError: 浏览器工具已禁用。请在设置 > 扩展中开启。"
+                dispatch["web_scan"] = self._web_scan
+                dispatch["web_execute_js"] = self._web_execute_js
+                dispatch["web_open"] = self._web_open
+                dispatch["web_launch"] = self._web_launch
+            # Skill search tool (no feature gate)
+            if name == "skill_search":
+                dispatch["skill_search"] = self._skill_search
             handler = dispatch.get(name)
             if handler:
                 return handler(args)
@@ -330,6 +368,19 @@ class ToolExecutor:
             return f"List: {args.get('path') or 'workspace root'}"
         elif name == "web_fetch":
             return f"Fetch: {args.get('url', '')}"
+        elif name == "web_scan":
+            tabs_only = args.get('tabs_only', False)
+            return f"Web Scan: {'标签页列表' if tabs_only else '获取页面内容'}"
+        elif name == "web_execute_js":
+            script = args.get('script', '')
+            return f"Execute JS: {self._shorten(script, 80)}"
+        elif name == "web_open":
+            return f"Open: {args.get('url', 'about:blank')}"
+        elif name == "web_launch":
+            url = args.get('url')
+            return f"Launch Chrome{' → ' + url if url else ''}"
+        elif name == "skill_search":
+            return f"Skill Search: {args.get('query', '')}"
         return f"{name}: {json.dumps(args, ensure_ascii=False)[:100]}"
 
     # ── 工具实现 ──
@@ -491,6 +542,165 @@ class ToolExecutor:
         except Exception:
             pass  # 证据保存失败不影响主流程
 
+    # ── Browser CDP tools ──
+
+    def _web_scan(self, args: dict) -> str:
+        """Get browser page content or tab list via CDP Bridge."""
+        from browser_driver import get_browser_driver
+        driver = get_browser_driver()
+        if not driver.is_running:
+            return "ToolError: 浏览器驱动未启动。请在设置 > 扩展中启用浏览器工具。"
+        if not driver.has_connection:
+            return "ToolError: 没有已连接的浏览器扩展。请确认 CDP Bridge 扩展已安装并启用。"
+        if not driver.has_tabs:
+            return "ToolError: 扩展已连接，但没有可用的浏览器标签页。请在 Chrome 中打开一个网页（非 chrome:// 页面），然后重试。"
+
+        tabs_only = args.get('tabs_only', False)
+        switch_tab_id = args.get('switch_tab_id', '')
+        text_only = args.get('text_only', False)
+
+        # Switch tab if requested
+        if switch_tab_id:
+            if not driver.set_default_session(switch_tab_id):
+                return f"ToolError: 无法切换到标签页 {switch_tab_id}"
+
+        # Tab list
+        tabs = driver.connected_tabs
+        if tabs_only:
+            return json.dumps(tabs, ensure_ascii=False, indent=2)
+
+        # Get page content via JS
+        if text_only:
+            js_code = "document.body.innerText"
+        else:
+            js_code = (
+                "(() => {"
+                "  function simplify(el, depth) {"
+                "    if (!el || depth > 15) return '';"
+                "    if (el.nodeType === 3) return el.textContent.trim();"
+                "    if (el.nodeType !== 1) return '';"
+                "    const tag = el.tagName.toLowerCase();"
+                "    if (['script','style','noscript','svg','path'].includes(tag)) return '';"
+                "    const style = getComputedStyle(el);"
+                "    if (style.display === 'none' || style.visibility === 'hidden') return '';"
+                "    const rect = el.getBoundingClientRect();"
+                "    if (rect.width === 0 && rect.height === 0) return '';"
+                "    const attrs = [];"
+                "    if (el.id) attrs.push('id=' + el.id);"
+                "    if (el.className && typeof el.className === 'string') attrs.push('class=' + el.className.trim().substring(0, 60));"
+                "    if (tag === 'a' && el.href) attrs.push('href=' + el.href);"
+                "    if (tag === 'img' && el.src) attrs.push('src=' + el.src);"
+                "    if (tag === 'input') { attrs.push('type=' + (el.type||'text')); if(el.value) attrs.push('value=' + el.value.substring(0,50)); }"
+                "    const attrStr = attrs.length ? ' ' + attrs.join(' ') : '';"
+                "    const children = Array.from(el.childNodes).map(c => simplify(c, depth+1)).filter(Boolean).join('');"
+                "    if (!children && !el.textContent.trim()) return '';"
+                "    const blockTags = ['div','p','h1','h2','h3','h4','h5','h6','li','tr','section','article','nav','header','footer','main','form','table','ul','ol','select','textarea','button','label','fieldset','details','summary'];"
+                "    if (blockTags.includes(tag)) return '<' + tag + attrStr + '>\\n' + children + '\\n</' + tag + '>\\n';"
+                "    return '<' + tag + attrStr + '>' + children + '</' + tag + '>';"
+                "  }"
+                "  return simplify(document.body, 0);"
+                "})()"
+            )
+        try:
+            result = driver.execute_js(js_code, timeout=15)
+            content = result.get('data', '')
+            if isinstance(content, str) and len(content) > 15000:
+                content = content[:15000] + "\n... [truncated]"
+            tab_info = ""
+            if driver.default_session_id and driver.default_session_id in driver.sessions:
+                tab_info = f"[Tab: {driver.sessions[driver.default_session_id].title}]\n"
+            return tab_info + str(content)
+        except Exception as e:
+            return f"ToolError: web_scan 失败: {e}"
+
+    def _web_execute_js(self, args: dict) -> str:
+        """Execute JavaScript in the browser via CDP Bridge."""
+        from browser_driver import get_browser_driver
+        driver = get_browser_driver()
+        if not driver.is_running:
+            return "ToolError: 浏览器驱动未启动。请在设置 > 扩展中启用浏览器工具。"
+        if not driver.has_connection:
+            return "ToolError: 没有已连接的浏览器扩展。请确认 CDP Bridge 扩展已安装并启用。"
+        if not driver.has_tabs:
+            return "ToolError: 扩展已连接，但没有可用的浏览器标签页。请在 Chrome 中打开一个网页（非 chrome:// 页面），然后重试。"
+
+        script = args.get('script', '')
+        switch_tab_id = args.get('switch_tab_id', '')
+        no_monitor = args.get('no_monitor', False)
+        save_to_file = args.get('save_to_file', '')
+
+        if switch_tab_id:
+            if not driver.set_default_session(switch_tab_id):
+                return f"ToolError: 无法切换到标签页 {switch_tab_id}"
+
+        try:
+            result = driver.execute_js(script, timeout=15)
+            data = result.get('data')
+            # Save to file if requested
+            if save_to_file and data:
+                save_path = self._safe_path(save_to_file)
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                content = json.dumps(data, ensure_ascii=False, indent=2) if not isinstance(data, str) else data
+                save_path.write_text(content, 'utf-8')
+                return f"Result saved to {save_path}\n{str(data)[:5000]}"
+            result_str = json.dumps(data, ensure_ascii=False, indent=2) if not isinstance(data, str) else str(data)
+            if len(result_str) > 10000:
+                result_str = result_str[:10000] + "\n... [truncated]"
+            # Include new tabs info if any
+            new_tabs = result.get('newTabs', [])
+            if new_tabs:
+                result_str += f"\n\nNew tabs opened: {json.dumps(new_tabs, ensure_ascii=False)}"
+            return result_str
+        except TimeoutError as e:
+            return f"ToolError: JS 执行超时: {e}"
+        except RuntimeError as e:
+            return f"ToolError: JS 执行失败: {e}"
+
+    def _web_launch(self, args: dict) -> str:
+        """Launch Chrome browser and wait for extension connection."""
+        from browser_driver import get_browser_driver
+        driver = get_browser_driver()
+        if not driver.is_running:
+            return "ToolError: 浏览器驱动未启动。请在设置 > 扩展中启用浏览器工具。"
+
+        url = args.get('url')
+        if url and not url.startswith(('http://', 'https://', 'file://', 'about:')):
+            url = 'https://' + url
+        timeout = args.get('timeout', 30)
+
+        try:
+            result = driver.launch_browser(url=url, timeout=timeout)
+            status = "Chrome 已启动" if not result.get('already_running') else "Chrome 已在运行"
+            tabs = result.get('tabs', [])
+            if url and tabs:
+                return f"{status}，扩展已连接。已打开: {url}"
+            elif tabs:
+                return f"{status}，扩展已连接。当前有 {len(tabs)} 个标签页。"
+            else:
+                return f"{status}，扩展已连接。"
+        except TimeoutError as e:
+            return f"ToolError: {e}"
+        except RuntimeError as e:
+            return f"ToolError: {e}"
+
+    def _web_open(self, args: dict) -> str:
+        """Open a new tab in the user's browser via CDP Bridge."""
+        from browser_driver import get_browser_driver
+        driver = get_browser_driver()
+        if not driver.is_running:
+            return "ToolError: 浏览器驱动未启动。请在设置 > 扩展中启用浏览器工具。"
+        if not driver.has_connection:
+            return "ToolError: 没有已连接的浏览器扩展。请确认 CDP Bridge 扩展已安装并启用。"
+
+        url = args.get('url', 'about:blank')
+        if not url.startswith(('http://', 'https://', 'file://', 'about:')):
+            url = 'https://' + url
+        try:
+            tab = driver.open_tab(url, timeout=15)
+            return json.dumps(tab, ensure_ascii=False)
+        except Exception as e:
+            return f"ToolError: 打开标签页失败: {e}"
+
     # ── P4-4: ADB 设备自动化 ──
 
     def _is_dangerous_adb(self, command: str) -> tuple[bool, str]:
@@ -559,6 +769,25 @@ class ToolExecutor:
             )
         except Exception:
             pass
+
+    def _skill_search(self, args: dict) -> str:
+        """搜索外部 Skill 库（105K+ 技能卡）。"""
+        try:
+            from skill_search import search, format_results_text, SkillSearchError
+        except ImportError:
+            return "ToolError: skill_search 模块未安装。"
+        query = args.get("query", "")
+        if not query:
+            return "ToolError: query 参数不能为空。"
+        category = args.get("category")
+        top_k = args.get("top_k", 5)
+        try:
+            results = search(query, category=category, top_k=top_k)
+            return format_results_text(results, query)
+        except SkillSearchError as e:
+            return f"ToolError: Skill 搜索失败 - {e}"
+        except Exception as e:
+            return f"ToolError: Skill 搜索异常 - {e}"
 
     @staticmethod
     def _html_to_text(html_text: str) -> str:

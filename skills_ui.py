@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 
 from config import load_config
 from skill_manager import Skill, SkillManager
+from theme import build_checkbox_stylesheet
 
 
 def _is_light_theme() -> bool:
@@ -53,7 +54,7 @@ def _dialog_style() -> str:
         accent = "#5ee9ff"
     primary = accent if light else accent
     primary_hover = "#1d4ed8" if light else "#2563eb"
-    check_outline = accent
+    checkbox_css = build_checkbox_stylesheet("light" if light else "dark", accent)
     return (
         f"QDialog{{background:{bg};color:{text};}}"
         f"QWidget{{color:{text};}}"
@@ -69,11 +70,7 @@ def _dialog_style() -> str:
         f"QPushButton:pressed{{background:{btn_hover};}}"
         f"QPushButton:default{{background:{primary};color:#ffffff;border:1px solid {primary};}}"
         f"QPushButton:default:hover{{background:{primary_hover};border:1px solid {primary_hover};}}"
-        f"QCheckBox{{color:{dim};font-size:13px;}}"
-        f"QCheckBox::indicator{{width:16px;height:16px;border-radius:4px;border:2px solid {check_outline};background:transparent;}}"
-        f"QCheckBox::indicator:unchecked{{background:transparent;}}"
-        f"QCheckBox::indicator:checked{{background:{accent};border:2px solid {accent};}}"
-        f"QCheckBox::indicator:hover{{border:2px solid {accent};}}"
+        f"{checkbox_css}"
         f"QScrollBar:vertical{{background:transparent;width:10px;margin:2px 0 2px 0;border:none;}}"
         f"QScrollBar::handle:vertical{{background:{border};min-height:32px;border-radius:3px;}}"
         f"QScrollBar::handle:vertical:hover{{background:{dim};}}"
@@ -144,36 +141,107 @@ class SkillSaveDialog(QDialog):
         return self._saved
 
 
-class SkillsManagerDialog(QDialog):
-    """List / edit / reorder / delete skills."""
+class SkillsPanel(QWidget):
+    """Skills 管理面板（嵌入 content_stack，和 Metrics/Audit 一致）"""
 
-    def __init__(self, parent=None):
+    def __init__(self, cfg, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("管理 Skills")
-        self.resize(700, 520)
+        self.cfg = cfg
+        self.setObjectName("SkillsPanel")
         self._mgr = SkillManager()
-        self.setStyleSheet(_dialog_style())
-        root = QHBoxLayout(self)
+        self._setup_ui()
+        self._reload_list(select_id=None)
+
+    def _is_light(self) -> bool:
+        return str(getattr(self.cfg, "theme", "dark")).lower() == "light"
+
+    def _setup_ui(self):
+        light = self._is_light()
+        txt = "#0f172a" if light else "#e5e7eb"
+        dim = "#64748b" if light else "#9ca3af"
+        panel_bg = "#f8fafc" if light else "#232a31"
+        border = "#d1d5db" if light else "#3b4552"
+        input_bg = "#ffffff" if light else "#12161b"
+        btn_bg = "#f3f4f6" if light else "#2b3440"
+        btn_hover = "#e5e7eb" if light else "#3a4656"
+        cfg_obj = load_config()
+        accent = str(getattr(cfg_obj, "accent_color", "#5ee9ff") or "#5ee9ff").strip()
+        if not accent.startswith("#"):
+            accent = "#5ee9ff"
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(12)
+
+        # Header
+        header = QHBoxLayout()
+        title = QLabel("Skills Manager")
+        title.setStyleSheet(f"font-size:22px;font-weight:800;color:{txt};background:transparent;")
+        header.addWidget(title)
+        header.addStretch(1)
+        root.addLayout(header)
+
+        # 主内容：左侧列表 + 右侧编辑
+        content = QHBoxLayout()
+        content.setSpacing(12)
+
+        # 左侧列表
         self.list_w = QListWidget()
         self.list_w.setMinimumWidth(200)
         self.list_w.currentRowChanged.connect(self._on_sel)
-        root.addWidget(self.list_w)
+        self.list_w.setStyleSheet(
+            f"QListWidget{{background:{panel_bg};color:{txt};border:1px solid {border};"
+            f"border-radius:8px;padding:6px;selection-background-color:{accent};selection-color:#ffffff;}}"
+            f"QListWidget::item{{padding:4px 8px;border-radius:4px;}}"
+            f"QListWidget::item:selected{{background:{accent};color:#ffffff;}}"
+            f"QListWidget::item:hover{{background:{btn_hover};}}"
+        )
+        content.addWidget(self.list_w)
+
+        # 右侧编辑面板
         panel = QWidget()
+        panel.setStyleSheet("background:transparent;")
         pl = QVBoxLayout(panel)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(8)
+
+        _input_css = (
+            f"QLineEdit,QTextEdit{{background:{input_bg};color:{txt};border:1px solid {border};"
+            f"border-radius:8px;padding:6px;selection-background-color:{accent};selection-color:#ffffff;}}"
+        )
+        _label_css = f"QLabel{{color:{dim};font-size:13px;background:transparent;}}"
+
         form = QFormLayout()
+        form.setSpacing(6)
         self.ed_name = QLineEdit()
+        self.ed_name.setStyleSheet(_input_css)
         self.ed_kw = QLineEdit()
+        self.ed_kw.setStyleSheet(_input_css)
         self.ed_steps = QTextEdit()
+        self.ed_steps.setStyleSheet(_input_css)
         self.ed_steps.setMinimumHeight(180)
         self.chk_en = QCheckBox("启用")
         self.chk_en.setChecked(True)
         self.chk_en.toggled.connect(self._save_enabled_only)
-        form.addRow("名称", self.ed_name)
-        form.addRow("关键词（逗号）", self.ed_kw)
-        form.addRow("步骤", self.ed_steps)
+        self.chk_en.setStyleSheet(build_checkbox_stylesheet("light" if light else "dark", accent))
+
+        lbl_name = QLabel("名称"); lbl_name.setStyleSheet(_label_css)
+        lbl_kw = QLabel("关键词（逗号）"); lbl_kw.setStyleSheet(_label_css)
+        lbl_steps = QLabel("步骤"); lbl_steps.setStyleSheet(_label_css)
+        form.addRow(lbl_name, self.ed_name)
+        form.addRow(lbl_kw, self.ed_kw)
+        form.addRow(lbl_steps, self.ed_steps)
         form.addRow("", self.chk_en)
         pl.addLayout(form)
+
+        # 按钮行
+        _btn_css = (
+            f"QPushButton{{background:{btn_bg};color:{txt};border:1px solid {border};"
+            f"border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;}}"
+            f"QPushButton:hover{{background:{btn_hover};}}"
+        )
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         self.btn_new = QPushButton("新建")
         self.btn_del = QPushButton("删除")
         self.btn_up = QPushButton("上移")
@@ -187,11 +255,12 @@ class SkillsManagerDialog(QDialog):
         self.btn_save.clicked.connect(self._save_current)
         self.btn_stats.clicked.connect(self._show_stats)
         for b in (self.btn_new, self.btn_del, self.btn_up, self.btn_dn, self.btn_save, self.btn_stats):
+            b.setStyleSheet(_btn_css)
             btn_row.addWidget(b)
         pl.addLayout(btn_row)
         pl.addStretch(1)
-        root.addWidget(panel, 1)
-        self._reload_list(select_id=None)
+        content.addWidget(panel, 1)
+        root.addLayout(content, 1)
 
     def _all_ids_in_order(self) -> list[str]:
         return [s.id for s in self._mgr.list_skills()]

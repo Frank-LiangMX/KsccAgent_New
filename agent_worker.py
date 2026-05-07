@@ -92,10 +92,9 @@ class AgentWorker(QThread):
                         if n == 'edit_file' and isinstance(a, dict):
                             self.diff_preview.emit(a.get('path', ''), a.get('old_string', ''), a.get('new_string', ''))
                     elif t == 'thinking':
-                        th = e.get('text', '')
-                        st = self._thinking_status(th)
-                        if st:
-                            self.kscc_status.emit(st)
+                        # thinking 事件不更新状态栏，避免流式 delta 导致状态快速切换
+                        # 用户只需要看到工具调用状态，不需要看到 LLM 的内部推理过程
+                        pass
                     elif t == 'kscc_tool':
                         n = e.get('name', '')
                         inp = e.get('input', {})
@@ -107,7 +106,12 @@ class AgentWorker(QThread):
                         if e.get('name', '') in ('write_file', 'edit_file') and not e.get('error'):
                             pass
                     elif t == 'context':
-                        self.context_info.emit(json.dumps(e.get('summary', {})))
+                        summary = e.get('summary', {})
+                        if e.get('warning'):
+                            summary['_warning'] = e['warning']
+                        if e.get('note'):
+                            summary['_note'] = e['note']
+                        self.context_info.emit(json.dumps(summary))
                     elif t in ('skill_match', 'skill_miss', 'skill_ambiguous', 'skill_status'):
                         self.skill_info.emit(json.dumps(e, ensure_ascii=False))
                     elif t == 'skill_save_draft':
@@ -157,6 +161,7 @@ class TaskWorker(QThread):
     context_info = pyqtSignal(str)
     skill_info = pyqtSignal(str)
     skill_draft = pyqtSignal(str)
+    skill_auto_saved = pyqtSignal(str, float)  # skill_id, score
     memory_hits = pyqtSignal(str)  # P3-5
     risk_template = pyqtSignal(str)  # P4-5
     done = pyqtSignal(str, int, str)
@@ -165,21 +170,18 @@ class TaskWorker(QThread):
 
     # 任务状态机信号
     task_start = pyqtSignal(str, str)         # task_id, goal
+    task_resume = pyqtSignal(str, str, dict)  # task_id, goal, resume_info
     plan_generated = pyqtSignal(str)           # plan JSON
-    step_start = pyqtSignal(str, str)          # step_id, description
-    step_complete = pyqtSignal(str, bool, str) # step_id, success, output
-    step_failed = pyqtSignal(str, str)         # step_id, error
-    step_retry = pyqtSignal(str, int)          # step_id, retry_count
-    reflection = pyqtSignal(str, str, str)     # step_id, observation, suggestion
     task_progress = pyqtSignal(str)            # progress JSON
     task_complete = pyqtSignal(str, str)       # task_id, result
     task_failed = pyqtSignal(str, str)         # task_id, error
 
-    def __init__(self, task_executor, prompt, attachments=None):
+    def __init__(self, task_executor, prompt, attachments=None, resume_state=None):
         super().__init__()
         self.task_executor = task_executor
         self.prompt = prompt
         self.attachments = attachments or []
+        self.resume_state = resume_state
         self._stop_requested = False
 
     def stop(self):
@@ -191,7 +193,11 @@ class TaskWorker(QThread):
 
         async def _r():
             try:
-                async for e in self.task_executor.execute_task(self.prompt, self.attachments):
+                if self.resume_state:
+                    gen = self.task_executor.resume_task(self.resume_state)
+                else:
+                    gen = self.task_executor.execute_task(self.prompt, self.attachments)
+                async for e in gen:
                     if self._stop_requested or self.isInterruptionRequested():
                         break
                     t = e.get('type', '')
@@ -212,31 +218,20 @@ class TaskWorker(QThread):
                     elif t == 'task_start':
                         self.task_start.emit(e.get('task_id', ''), e.get('goal', ''))
                         self.kscc_status.emit("Planning...")
+                    elif t == 'task_resume':
+                        self.task_resume.emit(e.get('task_id', ''), e.get('goal', ''), e.get('resume_info', {}))
+                        self.kscc_status.emit("Resuming task...")
                     elif t == 'plan_generated':
                         self.plan_generated.emit(json.dumps(e, ensure_ascii=False))
                         self.kscc_status.emit("Plan ready, executing...")
-                    elif t == 'step_start':
-                        self.step_start.emit(e.get('step_id', ''), e.get('description', ''))
-                        self.kscc_status.emit(f"Step: {e.get('description', '')[:50]}")
-                    elif t == 'step_complete':
-                        self.step_complete.emit(
-                            e.get('step_id', ''), True, e.get('output', '')
-                        )
-                    elif t == 'step_failed':
-                        self.step_failed.emit(e.get('step_id', ''), e.get('error', ''))
-                    elif t == 'step_retry':
-                        self.step_retry.emit(e.get('step_id', 0), e.get('retry_count', 0))
-                        self.kscc_status.emit(f"Retrying step {e.get('step_id', '')}...")
-                    elif t == 'step_skipped':
-                        self.kscc_status.emit(f"Skipped: {e.get('reason', '')}")
-                    elif t == 'reflection':
-                        self.reflection.emit(
-                            e.get('step_id', ''),
-                            e.get('observation', ''),
-                            e.get('suggestion', ''),
-                        )
                     elif t == 'task_progress':
                         self.task_progress.emit(json.dumps(e.get('progress', {})))
+                    elif t == 'skill_info':
+                        self.skill_info.emit(json.dumps(e, ensure_ascii=False))
+                    elif t == 'skill_save_draft':
+                        self.skill_draft.emit(json.dumps(e.get('draft', {}), ensure_ascii=False))
+                    elif t == 'skill_auto_saved':
+                        self.skill_auto_saved.emit(e.get('skill_id', ''), e.get('score', 0.0))
                     elif t == 'memory_hits':
                         self.memory_hits.emit(json.dumps(e.get('hits', {}), ensure_ascii=False))
                     elif t == 'risk_template':
@@ -262,3 +257,70 @@ class TaskWorker(QThread):
             asyncio.run(_r())
         except Exception as ex:
             self.error.emit(f"TaskWorker: {ex}")
+
+
+_CLASSIFY_PROMPT = """Classify the user task. Reply with exactly one word only.
+
+simple = single question, chat, simple query, brief explanation
+complex = multi-step, browser operations, file editing, code generation, refactoring, debugging, planning, research tasks
+
+Reply ONLY: simple or complex"""
+
+
+class ClassifyWorker(QThread):
+    """轻量级分类线程，判断任务是否需要 plan 模式。"""
+    finished = pyqtSignal(bool)  # True = complex, False = simple
+
+    def __init__(self, config, prompt: str):
+        super().__init__()
+        self.config = config
+        self.prompt = prompt
+
+    def run(self):
+        import asyncio
+        try:
+            asyncio.run(self._classify())
+        except Exception as ex:
+            # 分类失败时默认 simple，不阻塞用户
+            self.finished.emit(False)
+
+    async def _classify(self):
+        from llm_client import create_backend
+        from config import get_active_provider
+
+        provider = get_active_provider(self.config)
+        backend = create_backend(provider, workspace=self.config.workspace)
+        messages = [
+            {"role": "system", "content": _CLASSIFY_PROMPT},
+            {"role": "user", "content": self.prompt[:2000]},
+        ]
+        text = ""
+        error_msg = ""
+        try:
+            async for ev in backend.chat(messages, tools=[], max_tokens=100):
+                ev_type = ev.get("type", "")
+                if ev_type == "text_delta":
+                    text += ev.get("text", "")
+                elif ev_type == "thinking":
+                    # 某些模型（reasoning models）只返回 thinking，不返回 content
+                    # 从 thinking 文本中尝试提取分类结果
+                    th = ev.get("text", "").strip().lower()
+                    if "complex" in th:
+                        text = "complex"
+                    elif "simple" in th and not text:
+                        text = "simple"
+                elif ev_type == "error":
+                    error_msg = ev.get("content", "")
+                    print(f"[ClassifyWorker] API error: {error_msg}")
+        except Exception as ex:
+            error_msg = str(ex)
+            print(f"[ClassifyWorker] exception: {ex}")
+        finally:
+            close_fn = getattr(backend, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+        result = text.strip().lower()
+        is_complex = "complex" in result
+        print(f"[ClassifyWorker] prompt={self.prompt[:80]}... → raw='{text.strip()}' → error='{error_msg}' → is_complex={is_complex}")
+        self.finished.emit(is_complex)

@@ -329,6 +329,7 @@ class TaskStepsPanel(QFrame):
     """任务步骤面板"""
 
     step_selected = pyqtSignal(str)  # step_id
+    resume_clicked = pyqtSignal()    # 用户点击恢复按钮
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -336,6 +337,7 @@ class TaskStepsPanel(QFrame):
         self.setFrameShadow(QFrame.Shadow.Raised)
         self._setup_ui()
         self._loaded_history = False
+        self._resumable_state = None  # 可恢复的任务状态
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -395,6 +397,28 @@ class TaskStepsPanel(QFrame):
         self._history_bar.mousePressEvent = self._on_history_clicked
         layout.addWidget(self._history_bar)
 
+        # 恢复按钮（默认隐藏，任务失败后显示）
+        self._resume_btn = QToolButton()
+        self._resume_btn.setText("▶ Resume from failed step")
+        self._resume_btn.setToolTip("Reset failed steps and continue execution")
+        self._resume_btn.setStyleSheet("""
+            QToolButton {
+                background-color: #3B82F6;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: bold;
+            }
+            QToolButton:hover {
+                background-color: #2563EB;
+            }
+        """)
+        self._resume_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._resume_btn.clicked.connect(self.resume_clicked.emit)
+        self._resume_btn.hide()
+        layout.addWidget(self._resume_btn)
+
         # 底部状态栏
         self._status_label = QLabel("No active task")
         self._status_label.setFont(QFont("", 8))
@@ -443,8 +467,19 @@ class TaskStepsPanel(QFrame):
         """更新任务状态（实时任务）"""
         self._progress_widget.update_task_state(task_state)
         self._status_label.setText(f"Task {task_state.task_id}: {task_state.phase.value.title()}")
-        # 有实时任务时隐藏历史栏
+        # 有实时任务时隐藏历史栏和恢复按钮
         self._history_bar.hide()
+        self._resume_btn.hide()
+
+    def show_resume(self, task_state: TaskState):
+        """任务失败后显示恢复按钮"""
+        self._resumable_state = task_state
+        self._resume_btn.setText("▶ Resume task")
+        self._resume_btn.show()
+
+    def get_resumable_state(self) -> TaskState | None:
+        """获取可恢复的任务状态"""
+        return self._resumable_state
 
     def add_step_event(self, step_id: str, event_type: str, data: dict = None):
         """添加步骤事件"""
@@ -452,6 +487,8 @@ class TaskStepsPanel(QFrame):
 
     def _on_refresh(self):
         """刷新 — 恢复显示历史栏"""
+        self._resume_btn.hide()
+        self._resumable_state = None
         if self._loaded_history:
             self._history_bar.show()
             self._status_label.setText("No active task")

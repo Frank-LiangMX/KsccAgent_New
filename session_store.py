@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,7 +21,7 @@ INDEX_FILE = SESSION_DIR / "index.json"
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 class Session:

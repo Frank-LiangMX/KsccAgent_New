@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont
 
-from theme import C_TEXT, C_DIM, C_PANEL, C_PANEL_HI, C_ACCENT, C_GREEN, C_RED, C_YELLOW
+from theme import C_TEXT, C_DIM, C_PANEL, C_PANEL_HI, C_ACCENT, C_GREEN, C_RED, C_YELLOW, build_combobox_stylesheet
 
 
 def _is_light(cfg) -> bool:
@@ -49,17 +49,22 @@ _EVENT_STYLE = {
 class AuditEventRow(QFrame):
     """单个审计事件行"""
 
-    def __init__(self, event_type: str, timestamp: str, summary: str, detail: str = "", parent=None):
+    def __init__(self, event_type: str, timestamp: str, summary: str, detail: str = "", light: bool = False, parent=None):
         super().__init__(parent)
         self.setObjectName("auditEventRow")
         self._detail = detail
         self._expanded = False
 
         icon_char, color = _EVENT_STYLE.get(event_type, ("•", C_DIM))
+        line_col = "rgba(15,23,42,0.08)" if light else "rgba(255,255,255,0.05)"
+        hover_bg = "#f3f6fa" if light else C_PANEL
+        time_col = "#64748b" if light else C_DIM
+        summary_col = "#0f172a" if light else C_TEXT
+        badge_bg = "rgba(15,23,42,0.05)" if light else "rgba(255,255,255,0.04)"
 
         self.setStyleSheet(
-            f"QFrame#auditEventRow {{ background: transparent; border-bottom: 1px solid rgba(255,255,255,0.05); }}"
-            f"QFrame#auditEventRow:hover {{ background: {C_PANEL}; }}"
+            f"QFrame#auditEventRow {{ background: transparent; border-bottom: 1px solid {line_col}; }}"
+            f"QFrame#auditEventRow:hover {{ background: {hover_bg}; }}"
         )
 
         layout = QHBoxLayout(self)
@@ -76,7 +81,7 @@ class AuditEventRow(QFrame):
         # Timestamp
         ts_lbl = QLabel(timestamp)
         ts_lbl.setFixedWidth(70)
-        ts_lbl.setStyleSheet(f"color: {C_DIM}; font-size: 11px; font-family: 'JetBrains Mono', monospace; background: transparent;")
+        ts_lbl.setStyleSheet(f"color: {time_col}; font-size: 11px; font-family: 'JetBrains Mono', monospace; background: transparent;")
         layout.addWidget(ts_lbl)
 
         # Event type badge
@@ -84,13 +89,14 @@ class AuditEventRow(QFrame):
         badge.setFixedWidth(100)
         badge.setStyleSheet(
             f"color: {color}; font-size: 10px; font-weight: 700; "
-            f"background: rgba(255,255,255,0.04); border-radius: 4px; padding: 2px 6px;"
+            f"background: {badge_bg}; border-radius: 4px; padding: 2px 6px;"
         )
         layout.addWidget(badge)
 
         # Summary
         summary_lbl = QLabel(summary)
-        summary_lbl.setStyleSheet(f"color: {C_TEXT}; font-size: 12px; background: transparent;")
+        summary_lbl.setWordWrap(True)
+        summary_lbl.setStyleSheet(f"color: {summary_col}; font-size: 12px; background: transparent;")
         layout.addWidget(summary_lbl, 1)
 
     def mousePressEvent(self, event):
@@ -105,13 +111,17 @@ class AuditPanel(QWidget):
         super().__init__(parent)
         self.cfg = cfg
         self.setObjectName("AuditPanel")
-        self.log_dir = Path("logs/tasks")
+        ws = getattr(cfg, 'workspace', '') or str(Path(__file__).resolve().parent)
+        self.log_dir = Path(ws) / "logs" / "tasks"
         self._all_events = []
         self._setup_ui()
+        # Initial load on first show
+        QTimer.singleShot(500, self.refresh)
 
     def _setup_ui(self):
         txt = "#0f172a" if _is_light(self.cfg) else C_TEXT
         dim = "#64748b" if _is_light(self.cfg) else C_DIM
+        combo_css = build_combobox_stylesheet("light" if _is_light(self.cfg) else "dark")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
@@ -127,10 +137,8 @@ class AuditPanel(QWidget):
         # Session selector
         self.session_combo = QComboBox()
         self.session_combo.setMinimumWidth(200)
-        self.session_combo.setStyleSheet(
-            f"QComboBox{{background:{C_PANEL};color:{txt};border:1px solid rgba(255,255,255,0.1);"
-            f"border-radius:6px;padding:4px 10px;font-size:12px;}}"
-        )
+        self.session_combo.setMaxVisibleItems(12)
+        self.session_combo.setStyleSheet(combo_css)
         self.session_combo.currentIndexChanged.connect(self._on_session_changed)
         header.addWidget(self.session_combo)
 
@@ -139,10 +147,8 @@ class AuditPanel(QWidget):
         self.filter_combo.addItem("All Events")
         for etype in sorted(_EVENT_STYLE.keys()):
             self.filter_combo.addItem(etype)
-        self.filter_combo.setStyleSheet(
-            f"QComboBox{{background:{C_PANEL};color:{txt};border:1px solid rgba(255,255,255,0.1);"
-            f"border-radius:6px;padding:4px 10px;font-size:12px;}}"
-        )
+        self.filter_combo.setMaxVisibleItems(12)
+        self.filter_combo.setStyleSheet(combo_css)
         self.filter_combo.currentIndexChanged.connect(self._apply_filter)
         header.addWidget(self.filter_combo)
 
@@ -269,7 +275,7 @@ class AuditPanel(QWidget):
                 ts_display = ts_str[:8] if len(ts_str) >= 8 else ts_str
 
             summary = self._summarize_event(event["type"], event["data"])
-            row = AuditEventRow(event["type"], ts_display, summary)
+            row = AuditEventRow(event["type"], ts_display, summary, light=_is_light(self.cfg))
             self.events_layout.addWidget(row)
 
         self.events_layout.addStretch(1)

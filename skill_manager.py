@@ -127,6 +127,7 @@ class SkillMatchResult:
 
 class SkillManager:
     def __init__(self):
+        self._write_lock = __import__("threading").Lock()
         self._ensure_storage()
 
     def _ensure_storage(self):
@@ -168,81 +169,85 @@ class SkillManager:
         execution_plan: Optional[list[dict[str, Any]]] = None,
     ) -> Skill:
         """Create new skill. For updates use update_skill_full."""
-        skills, order = self._load_index()
-        sid = (skill_id or _slugify(name)).strip()
-        if sid in skills:
-            base = sid
-            i = 2
-            while sid in skills:
-                sid = f"{base}-{i}"
-                i += 1
-        skill = Skill(
-            id=sid,
-            name=name.strip() or "Untitled Skill",
-            intent_pattern=_normalize_keywords(intent_pattern),
-            steps=[str(s).strip() for s in steps if str(s).strip()],
-            success_count=0,
-            last_used_at="",
-            enabled=enabled,
-            execution_plan=execution_plan or [],
-        )
-        self._write_skill_file(skill)
-        skills[skill.id] = {
-            "id": skill.id,
-            "name": skill.name,
-            "intent_pattern": skill.intent_pattern,
-            "success_count": skill.success_count,
-            "last_used_at": skill.last_used_at,
-            "enabled": skill.enabled,
-        }
-        if skill.id not in order:
-            order.insert(0, skill.id)
-        self._save_index(skills, order)
+        with self._write_lock:
+            skills, order = self._load_index()
+            sid = (skill_id or _slugify(name)).strip()
+            if sid in skills:
+                base = sid
+                i = 2
+                while sid in skills:
+                    sid = f"{base}-{i}"
+                    i += 1
+            skill = Skill(
+                id=sid,
+                name=name.strip() or "Untitled Skill",
+                intent_pattern=_normalize_keywords(intent_pattern),
+                steps=[str(s).strip() for s in steps if str(s).strip()],
+                success_count=0,
+                last_used_at="",
+                enabled=enabled,
+                execution_plan=execution_plan or [],
+            )
+            self._write_skill_file(skill)
+            skills[skill.id] = {
+                "id": skill.id,
+                "name": skill.name,
+                "intent_pattern": skill.intent_pattern,
+                "success_count": skill.success_count,
+                "last_used_at": skill.last_used_at,
+                "enabled": skill.enabled,
+            }
+            if skill.id not in order:
+                order.insert(0, skill.id)
+            self._save_index(skills, order)
         return skill
 
     def update_skill_full(self, skill: Skill) -> Skill:
         """Overwrite skill by id (name, patterns, steps, enabled). Keeps success_count/last_used unless reset desired."""
-        skills, order = self._load_index()
-        if skill.id not in skills and skill.id not in order:
-            order.insert(0, skill.id)
-        skills[skill.id] = {
-            "id": skill.id,
-            "name": skill.name,
-            "intent_pattern": skill.intent_pattern,
-            "success_count": skill.success_count,
-            "last_used_at": skill.last_used_at,
-            "enabled": skill.enabled,
-        }
-        self._write_skill_file(skill)
-        self._save_index(skills, order)
+        with self._write_lock:
+            skills, order = self._load_index()
+            if skill.id not in skills and skill.id not in order:
+                order.insert(0, skill.id)
+            skills[skill.id] = {
+                "id": skill.id,
+                "name": skill.name,
+                "intent_pattern": skill.intent_pattern,
+                "success_count": skill.success_count,
+                "last_used_at": skill.last_used_at,
+                "enabled": skill.enabled,
+            }
+            self._write_skill_file(skill)
+            self._save_index(skills, order)
         return skill
 
     def delete_skill(self, skill_id: str) -> bool:
-        skills, order = self._load_index()
-        if skill_id in skills:
-            del skills[skill_id]
-        order = [x for x in order if x != skill_id]
-        self._save_index(skills, order)
-        path = SKILLS_ITEMS_DIR / f"{skill_id}.json"
-        if path.exists():
-            try:
-                path.unlink()
-            except OSError:
-                return False
+        with self._write_lock:
+            skills, order = self._load_index()
+            if skill_id in skills:
+                del skills[skill_id]
+            order = [x for x in order if x != skill_id]
+            self._save_index(skills, order)
+            path = SKILLS_ITEMS_DIR / f"{skill_id}.json"
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    return False
         return True
 
     def reorder(self, new_order: list[str]) -> None:
-        skills, _ = self._load_index()
-        seen = set()
-        order = []
-        for sid in new_order:
-            if sid in skills and sid not in seen:
-                order.append(sid)
-                seen.add(sid)
-        for sid in skills:
-            if sid not in seen:
-                order.append(sid)
-        self._save_index(skills, order)
+        with self._write_lock:
+            skills, _ = self._load_index()
+            seen = set()
+            order = []
+            for sid in new_order:
+                if sid in skills and sid not in seen:
+                    order.append(sid)
+                    seen.add(sid)
+            for sid in skills:
+                if sid not in seen:
+                    order.append(sid)
+            self._save_index(skills, order)
 
     def load_skill(self, skill_id: str) -> Optional[Skill]:
         path = SKILLS_ITEMS_DIR / f"{skill_id}.json"
