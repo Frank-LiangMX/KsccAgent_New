@@ -168,9 +168,37 @@ class SkillManager:
         enabled: bool = True,
         execution_plan: Optional[list[dict[str, Any]]] = None,
     ) -> Skill:
-        """Create new skill. For updates use update_skill_full."""
+        """Create new skill, or merge into existing one if keywords overlap >= 60%."""
+        new_patterns = set(_normalize_keywords(intent_pattern))
         with self._write_lock:
             skills, order = self._load_index()
+
+            # Check for existing skill with high keyword overlap (>= 60%)
+            for existing_sid, existing_data in skills.items():
+                existing_patterns = set(existing_data.get("intent_pattern", []))
+                if not existing_patterns or not new_patterns:
+                    continue
+                intersection = len(existing_patterns & new_patterns)
+                union = len(existing_patterns | new_patterns)
+                overlap = intersection / union if union > 0 else 0.0
+                # Also check name match
+                name_match = existing_data.get("name", "").strip() == name.strip()
+                if overlap >= 0.6 or name_match:
+                    # Merge into existing skill
+                    sk = self.load_skill(existing_sid)
+                    if sk:
+                        merged_patterns = list(existing_patterns | new_patterns)
+                        sk.intent_pattern = merged_patterns
+                        sk.steps = [str(s).strip() for s in steps if str(s).strip()] or sk.steps
+                        if execution_plan:
+                            sk.execution_plan = execution_plan
+                        sk.enabled = enabled
+                        self._write_skill_file(sk)
+                        skills[existing_sid]["intent_pattern"] = sk.intent_pattern
+                        self._save_index(skills, order)
+                        return sk
+
+            # No similar skill found, create new one
             sid = (skill_id or _slugify(name)).strip()
             if sid in skills:
                 base = sid
@@ -181,7 +209,7 @@ class SkillManager:
             skill = Skill(
                 id=sid,
                 name=name.strip() or "Untitled Skill",
-                intent_pattern=_normalize_keywords(intent_pattern),
+                intent_pattern=list(new_patterns),
                 steps=[str(s).strip() for s in steps if str(s).strip()],
                 success_count=0,
                 last_used_at="",
@@ -280,26 +308,44 @@ class SkillManager:
         if not skill.enabled or not skill.intent_pattern:
             return 0.0
         score = 0.0
+        matched_count = 0
         kws = sorted(skill.intent_pattern, key=len, reverse=True)
         for kw in kws:
             if kw and kw in text:
-                score += len(kw) * 1.85
+                matched_count += 1
+                # 长关键词权重更高，短关键词（<3字符）权重降低
+                kw_len = len(kw)
+                if kw_len >= 6:
+                    score += kw_len * 2.5
+                elif kw_len >= 3:
+                    score += kw_len * 1.85
+                else:
+                    score += kw_len * 0.8
+        # 要求至少命中2个关键词（防止单个泛关键词误匹配）
+        if matched_count < 2:
+            return 0.0
         order_bonus = max(0.0, 4.5 - order_index * 0.25)
         score += order_bonus
-        score += min(28.0, (1.0 + max(0, skill.success_count)) ** 0.45 * 3.2)
+        # 降低success_count奖励上限（削弱正反馈循环）
+        score += min(12.0, (1.0 + max(0, skill.success_count)) ** 0.45 * 3.2)
         lu = _parse_iso(skill.last_used_at)
         if lu:
             age_days = (datetime.now(timezone.utc) - lu).total_seconds() / 86400.0
-            if age_days <= 3:
-                score += 6.0
-            elif age_days <= 14:
-                score += 3.0
+            # 新技能（从未成功使用）不享受recency bonus
+            if skill.success_count > 0:
+                if age_days <= 3:
+                    score += 6.0
+                elif age_days <= 14:
+                    score += 3.0
             # 退化系数：长期未使用降低权重
-            elif age_days > 60:
+            if age_days > 60:
                 score *= 0.2  # 60天以上未使用，权重降至20%
             elif age_days > 30:
                 score *= 0.5  # 30天以上未使用，权重降至50%
         return score
+
+    # 最低匹配分数阈值，低于此值视为无匹配
+    MIN_MATCH_SCORE = 25.0
 
     def match_detailed(self, prompt: str, top_k: int = 8) -> SkillMatchResult:
         text = (prompt or "").strip().lower()
@@ -323,7 +369,7 @@ class SkillManager:
                 continue
             idx = pos.get(skill.id, 99)
             s = self._score_skill(skill, text, idx)
-            if s > 0:
+            if s >= self.MIN_MATCH_SCORE:
                 ranked.append((s, skill))
         ranked.sort(key=lambda x: x[0], reverse=True)
         top = ranked[:top_k]

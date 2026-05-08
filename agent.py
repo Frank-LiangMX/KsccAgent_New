@@ -290,6 +290,69 @@ TOOLS_OPENAI = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_scheduled_task",
+            "description": "Create a scheduled task that runs automatically at a specified time. The agent must be running for scheduled tasks to execute.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Task name (used as identifier, e.g., '整理下载文件夹')"},
+                    "schedule": {"type": "string", "description": "Time to trigger in HH:MM format (e.g., '09:00')"},
+                    "prompt": {"type": "string", "description": "The instruction to execute when the task triggers (natural language)"},
+                    "repeat": {"type": "string", "description": "Repeat type: daily, weekday, weekly, monthly, once, every_Nh, every_Nm, every_Nd (e.g., 'every_3h', 'every_30m')", "default": "daily"},
+                    "max_delay_hours": {"type": "integer", "description": "Max hours after scheduled time before skipping (default 6). Useful if computer may be off.", "default": 6},
+                },
+                "required": ["name", "schedule", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_scheduled_tasks",
+            "description": "List all scheduled tasks with their status, schedule, and last execution info.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_scheduled_task",
+            "description": "Update a scheduled task's configuration. Use to enable/disable, change schedule, or modify the prompt.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Task name to update"},
+                    "enabled": {"type": "boolean", "description": "Enable (true) or disable (false) the task"},
+                    "schedule": {"type": "string", "description": "New schedule time in HH:MM format"},
+                    "prompt": {"type": "string", "description": "New prompt/instruction"},
+                    "repeat": {"type": "string", "description": "New repeat type"},
+                    "max_delay_hours": {"type": "integer", "description": "New max delay hours"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_scheduled_task",
+            "description": "Delete a scheduled task permanently.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Task name to delete"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 TOOLS_ANTHROPIC = [
@@ -463,6 +526,57 @@ TOOLS_ANTHROPIC = [
                 "top_k": {"type": "integer", "description": "Number of results to return (default 5)"},
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "create_scheduled_task",
+        "description": "Create a scheduled task that runs automatically at a specified time. The agent must be running for scheduled tasks to execute.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Task name (used as identifier, e.g., '整理下载文件夹')"},
+                "schedule": {"type": "string", "description": "Time to trigger in HH:MM format (e.g., '09:00')"},
+                "prompt": {"type": "string", "description": "The instruction to execute when the task triggers (natural language)"},
+                "repeat": {"type": "string", "description": "Repeat type: daily, weekday, weekly, monthly, once, every_Nh, every_Nm, every_Nd (e.g., 'every_3h', 'every_30m')", "default": "daily"},
+                "max_delay_hours": {"type": "integer", "description": "Max hours after scheduled time before skipping (default 6). Useful if computer may be off.", "default": 6},
+            },
+            "required": ["name", "schedule", "prompt"],
+        },
+    },
+    {
+        "name": "list_scheduled_tasks",
+        "description": "List all scheduled tasks with their status, schedule, and last execution info.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "update_scheduled_task",
+        "description": "Update a scheduled task's configuration. Use to enable/disable, change schedule, or modify the prompt.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Task name to update"},
+                "enabled": {"type": "boolean", "description": "Enable (true) or disable (false) the task"},
+                "schedule": {"type": "string", "description": "New schedule time in HH:MM format"},
+                "prompt": {"type": "string", "description": "New prompt/instruction"},
+                "repeat": {"type": "string", "description": "New repeat type"},
+                "max_delay_hours": {"type": "integer", "description": "New max delay hours"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "delete_scheduled_task",
+        "description": "Delete a scheduled task permanently.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Task name to delete"},
+            },
+            "required": ["name"],
         },
     },
 ]
@@ -882,6 +996,12 @@ class Agent:
             names = [f"{sk.name} ({sk.id})" for _, sk in mr.candidates[1:4]]
             if names:
                 extra = "\n[其他高相似技能（按需选择，不相关可忽略）: " + "; ".join(names) + "]\n"
+        # Token 级别交集检查：如果技能关键词与 prompt 实际交集 < 2，加强警告
+        prompt_lower = prompt.lower()
+        token_hits = sum(1 for kw in skill.intent_pattern if kw in prompt_lower)
+        weak_match_warning = ""
+        if token_hits < 2:
+            weak_match_warning = "（注意：该技能与当前任务关联度较低，仅供参考，请优先按用户要求执行。）\n"
         # 如果有录制的执行计划，注入回放指令
         if skill.execution_plan:
             plan_lines = []
@@ -903,12 +1023,12 @@ class Agent:
             plan_text = "\n".join(plan_lines)
             return (
                 f"{prompt}\n\n"
+                f"{weak_match_warning}"
                 "[已匹配本地技能 — 回放模式]\n"
                 f"- 技能: {skill.name}\n"
                 f"- ID: {skill.id}\n"
-                "- 指令: 以下是该技能上次成功执行的完整工具调用序列。请严格按照此序列执行，"
-                "参数可按当前上下文微调，但工具名和调用顺序不要改变。"
-                "如果某步失败，再自行规划替代方案。\n"
+                "- 指令: 以下是该技能上次成功执行的工具调用序列，仅供参考。"
+                "如果当前任务与该技能不相关，请忽略此序列，按用户要求自行规划。\n"
                 "[回放序列]\n"
                 f"{plan_text}\n"
                 f"{extra}"
@@ -917,10 +1037,11 @@ class Agent:
         steps = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(skill.steps[:8])) or "1. 按已验证的最佳流程执行。"
         return (
             f"{prompt}\n\n"
+            f"{weak_match_warning}"
             "[已匹配本地技能]\n"
             f"- 技能: {skill.name}\n"
             f"- ID: {skill.id}\n"
-            "- 指引: 当前任务适配时优先复用该流程；若约束不同请明确调整。\n"
+            "- 指引: 以下是一个历史参考流程，如果与当前任务不相关请忽略，按用户要求自行规划。\n"
             "[建议步骤]\n"
             f"{steps}\n"
             f"{extra}"
@@ -948,18 +1069,26 @@ class Agent:
                     seen.append(n)
         return seen
 
-    def _guess_keywords_from_prompt(self, text: str, max_n: int = 8) -> list[str]:
+    def _guess_keywords_from_prompt(self, text: str, max_n: int = 5) -> list[str]:
         t = (text or "").strip().lower()
         if not t:
             return []
         toks = re.findall(r"[a-zA-Z0-9_./-]+|[\u4e00-\u9fff]{2,}", t)
         stop = {
+            # English
             "the", "and", "for", "with", "this", "that", "from", "into", "your", "you", "are", "was", "has",
-            "please", "just", "only", "dont", "don't",
+            "please", "just", "only", "dont", "don't", "can", "could", "would", "should", "will",
+            # Chinese: generic verbs/particles/conjunctions
             "请", "帮我", "一下", "如何", "什么", "可以", "不要", "使用", "输出", "方案", "计划",
             "给我", "只给", "不要改", "不要修改", "代码", "文件", "内容", "建议", "一下子", "这个",
             "一下吧", "看看", "麻烦", "帮忙", "并且", "然后", "以及", "或者", "一个", "一些",
             "只输出", "分步计划", "重构建议", "不要实际修改文件",
+            # Chinese: overly generic task/execution words (root cause of false matches)
+            "任务", "执行", "定时", "设置", "进行", "完成", "操作", "处理", "分析",
+            "目前", "现在", "问题", "情况", "需要", "应该", "能够", "已经", "还是",
+            "打开", "查看", "删除", "创建", "修改", "更新", "添加", "运行", "测试",
+            "原因", "为什么", "怎么", "怎样", "哪些", "多少",
+            # Tools
             "edit_file", "write_file",
         }
         noise_patterns = [
@@ -972,23 +1101,73 @@ class Agent:
             w = w.strip("`'\".,:;!?()[]{}<>|")
             if not w:
                 continue
-            if w in stop or len(w) < 2:
+            if w in stop or len(w) < 4:  # raised from 2 to 4
                 continue
             if any(re.match(p, w) for p in noise_patterns):
                 continue
             if w.endswith(".py") and len(w) > 3:
                 stem = w[:-3]
-                if stem and stem not in out and stem not in stop:
+                if stem and stem not in out and stem not in stop and len(stem) >= 4:
                     out.append(stem)
             if w not in out:
                 out.append(w)
             if len(out) >= max_n:
                 break
-        return out
+        # If fewer than 2 specific keywords, don't generate a skill draft
+        return out if len(out) >= 2 else []
 
     def _build_skill_save_draft(self, last_assistant_text: str) -> Optional[dict]:
         prompt = self._run_user_prompt or ""
         if not prompt.strip():
+            return None
+        # 阻止任务执行器内部 prompt 被保存为技能
+        _internal_prefixes = (
+            "请为以下任务制定执行计划",
+            "请执行以下任务步骤",
+            "请执行以下任务",
+            "请反思以下步骤",
+            "摘要提示:",
+        )
+        if any(prompt.startswith(p) for p in _internal_prefixes):
+            return None
+        # 阻止问候语、闲聊、元对话保存为技能
+        _trivial_texts = {
+            "你好", "你好！", "你好。", "hi", "hello", "hey",
+            "你是谁", "你是谁？", "你是谁？",
+            "挺厉害", "挺厉害的", "厉害",
+            "我都不要", "不用了", "算了", "不要",
+            "打开了", "好的", "行", "ok", "okay", "嗯",
+            "谢谢", "谢谢！", "感谢", "thanks",
+        }
+        _normalized = prompt.strip().lower().rstrip("！!?？。.，,")
+        if _normalized in _trivial_texts:
+            return None
+        # 太短的 prompt（< 5 字符）不值得保存为技能
+        if len(_normalized) < 5:
+            return None
+        # "你好" 开头 + 无实质内容的不保存
+        if _normalized.startswith("你好") and len(_normalized) < 10:
+            return None
+        # 问句式元对话不保存（"你能做什么"、"你能发邮件吗" 等纯疑问）
+        _meta_questions = {
+            "你能做什么", "你能发邮件吗", "你能做定时任务吗", "你能定时执行任务吗",
+            "你可以做定时任务吗", "你能设置定时任务吗", "定时任务怎么做",
+            "你是什么模型", "你现在是什么模型", "你的模型是什么",
+            "你能看图片吗", "能看这张图片吗", "你看得见吗",
+            "你有什么功能", "你有哪些功能", "介绍一下你自己",
+        }
+        if _normalized in _meta_questions:
+            return None
+        # 模板/规划类 prompt 不保存（包含规划模板关键词）
+        _template_markers = ["请为以下任务制定执行计划", "输出格式", "```json", "步骤应该具体", "执行计划"]
+        if any(m in prompt for m in _template_markers):
+            return None
+        # 长 prompt + 编号列表 → 大概率是模板而非用户指令
+        if len(prompt) > 200 and sum(1 for m in ["1.", "2.", "3."] if m in prompt) >= 2:
+            return None
+        # LLM 回复表明任务未成功，不保存为技能
+        _failure_markers = ["我不确定", "我无法", "抱歉", "做不到", "不能完成", "有困难", "我不太确定"]
+        if any(m in (last_assistant_text or "") for m in _failure_markers):
             return None
         tools_used = self._collect_tool_names_from_messages()
         title = prompt.replace("\n", " ").strip()[:48] or "Skill"
@@ -1021,9 +1200,12 @@ class Agent:
             steps.append(f"摘要提示: {first}")
         if not steps:
             steps.append("以最近一次助手有效回答作为流程基线。")
+        keywords = self._guess_keywords_from_prompt(prompt)
+        if not keywords:
+            return None  # Not enough specific keywords to create a skill
         draft = {
             "name": title,
-            "intent_pattern": self._guess_keywords_from_prompt(prompt),
+            "intent_pattern": keywords,
             "steps": steps[:10],
             "source_prompt": prompt[:4000],
         }

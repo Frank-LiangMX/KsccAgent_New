@@ -705,13 +705,29 @@ class ChatBubble(QFrame):
 
     def set_text(self, t):
         self._raw_text = str(t or "")
-        if self.role == "assistant" and self._render_markdown:
+        # Allow markdown rendering for assistant/tool bubbles (tool output often contains code fences).
+        if self.role in ("assistant", "tool") and self._render_markdown:
             self._render_assistant_content()
         else:
             self.segment_wrap.hide()
             self.body.setVisible(bool(str(t or "").strip()))
             self.body.setPlainText(self._raw_text)
         QTimer.singleShot(0, self._fit)
+
+    def enable_markdown_render(self):
+        """Enable markdown render for deferred bulk restores."""
+        if self._render_markdown:
+            return
+        self._render_markdown = True
+        if self.role in ("assistant", "tool"):
+            try:
+                self._render_assistant_content()
+            except Exception:
+                # Fallback to plain text on unexpected render failure.
+                self.segment_wrap.hide()
+                self.body.setVisible(bool(self._raw_text.strip()))
+                self.body.setPlainText(self._raw_text)
+            QTimer.singleShot(0, self._fit)
 
     def append_text(self, t):
         if self.role == "assistant":
@@ -832,8 +848,15 @@ class ChatBubble(QFrame):
         def _fit_then_scroll():
             self._fit()
             if self._scroll_area:
+                # Only autoscroll if the user is already near the bottom.
+                # This prevents history re-renders from yanking the viewport back down.
                 sb = self._scroll_area.verticalScrollBar()
-                sb.setValue(sb.maximum())
+                try:
+                    at_bottom = (sb.maximum() - sb.value()) <= 24
+                except Exception:
+                    at_bottom = False
+                if at_bottom:
+                    sb.setValue(sb.maximum())
         QTimer.singleShot(0, _fit_then_scroll)
 
     def _render_attachments(self):

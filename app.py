@@ -62,11 +62,13 @@ from file_tree import FileTree
 from settings_page import SettingsPage
 from metrics_panel import MetricsPanel
 from audit_panel import AuditPanel
+from scheduled_panel import ScheduledTasksPanel
 from agent_worker import AgentWorker, TaskWorker
 
 from agent import Agent
 from task_executor import TaskExecutor
 from task_steps_widget import TaskStepsPanel
+from scheduler import TaskScheduler
 from config import (
     load_config,
     Config,
@@ -135,6 +137,8 @@ class MainWindow(QMainWindow):
         self._last_task_executor = None  # 最近一次的 TaskExecutor（用于 resume）
         self._cur_session: Optional[Session] = None
         self._session_run_state: dict[str, str] = {}
+        # Per-session status text shown above the composer (ChatPanel.set_kscc_status).
+        self._session_chat_status: dict[str, str] = {}
         self._session_group_collapsed: dict[str, bool] = {}
         self._pending_user_message_meta: Optional[dict] = None
         self._pending_skill_draft: Optional[dict] = None
@@ -158,6 +162,7 @@ class MainWindow(QMainWindow):
         self._tooltip_suppressed_until = 0.0
         self._open_latest_session_on_startup()
         self._start_browser_driver()
+        self._init_scheduler()
 
     def eventFilter(self, obj, event):
         try:
@@ -181,6 +186,49 @@ class MainWindow(QMainWindow):
     def _open_latest_session_on_startup(self):
         """Start on an empty session instead of auto-opening an existing one."""
         self._new_session()
+
+    def _set_session_chat_status(self, sid: str, text: str):
+        """Set per-session composer status; only display it when sid is the current session."""
+        sid = str(sid or "")
+        text = str(text or "")
+        if sid:
+            self._session_chat_status[sid] = text
+        if self._is_current_session(sid):
+            self.chat.set_kscc_status(text)
+
+    def _init_scheduler(self):
+        """Initialize the scheduled task scheduler (non-blocking)."""
+        try:
+            _ws = self.config.workspace or os.path.dirname(os.path.abspath(__file__))
+            sche_dir = os.path.join(_ws, "sche_tasks")
+            self._scheduler = TaskScheduler(sche_dir=sche_dir, check_interval_ms=30000, parent=self)
+            # Attach to config so tool_executor can access it
+            self.config._scheduler = self._scheduler
+            self._scheduler.task_due.connect(self._on_scheduled_task_due)
+            self._scheduler.task_skipped.connect(self._on_scheduled_task_skipped)
+            self._scheduler.start()
+        except Exception:
+            self._scheduler = None
+
+    def _on_scheduled_task_due(self, task_name: str, prompt: str):
+        """Handle a scheduled task that is due for execution."""
+        # If a task is already running in the background, queue it
+        pending = getattr(self, "_pending_scheduled", [])
+        # treat "any running scheduled worker" as running
+        if any((w is not None and w.isRunning()) for w in self._workers.values()):
+            pending.append((task_name, prompt))
+            self._pending_scheduled = pending
+            if hasattr(self, "slbl"):
+                self.slbl.setText(f"定时任务 [{task_name}] 已排队...")
+            return
+        self._execute_scheduled_task(task_name, prompt)
+
+    def _on_scheduled_task_skipped(self, task_name: str, reason: str):
+        try:
+            if hasattr(self, "slbl"):
+                self.slbl.setText(f"Scheduled task skipped: {task_name}")
+        except Exception:
+            pass
 
     def _apply(self):
         mode = "light" if str(getattr(self.config, "theme", "dark")).lower() == "light" else "dark"
@@ -294,41 +342,32 @@ class MainWindow(QMainWindow):
             self._file_tree_toggle.setStyleSheet(_with_tooltip_style(_tss, light))
         if hasattr(self, "_session_toggle"):
             self._session_toggle.setStyleSheet(_with_tooltip_style(_tss, light))
-        if hasattr(self, "ws_btn"):
-            self.ws_btn.setStyleSheet(
-                _with_tooltip_style(
-                    "QPushButton{background:transparent;border:none;border-radius:8px}"
-                    f"QPushButton:hover{{background:{hover_bg}}}",
-                    light,
-                )
-            )
         if hasattr(self, "model_lbl"):
             self.model_lbl.setVisible(False)
-        if hasattr(self, "ws_lbl"):
-            self.ws_lbl.setStyleSheet(f"color:{dim};font-size:11px;background:transparent;max-width:220px")
-        if hasattr(self, "settings_btn"):
-            self.settings_btn.setStyleSheet(
-                _with_tooltip_style(
-                    f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px}}"
-                    f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
-                    light,
-                )
-            )
-            if not (hasattr(self, "content_stack") and self.content_stack.currentIndex() == 1):
-                self.settings_btn.setIcon(quark_icon("settings", 18))
         _tb_btn_css = (
-            f"QPushButton{{background:transparent;border:none;border-radius:10px;padding:0 10px;color:{dim};font-size:11px;font-weight:600;text-align:center;}}"
+            f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px;font-weight:500}}"
             f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}"
         )
+        if hasattr(self, "settings_btn"):
+            self.settings_btn.setStyleSheet(_with_tooltip_style(_tb_btn_css, light))
+            # Icon is controlled by _sync_settings_toolbar_button(); do not override it on subpages.
+            if hasattr(self, "content_stack") and self.content_stack.currentIndex() == 0:
+                self.settings_btn.setIcon(quark_icon("settings", 18))
         if hasattr(self, "skills_btn"):
             self.skills_btn.setStyleSheet(_with_tooltip_style(_tb_btn_css, light))
         if hasattr(self, "metrics_btn"):
             self.metrics_btn.setStyleSheet(_with_tooltip_style(_tb_btn_css, light))
         if hasattr(self, "audit_btn"):
             self.audit_btn.setStyleSheet(_with_tooltip_style(_tb_btn_css, light))
-        if hasattr(self, "ws_lbl"):
-            self.ws_lbl.setStyleSheet(
-                f"color:{dim};font-size:11px;font-weight:500;background:transparent;max-width:180px;padding-left:2px;"
+        if hasattr(self, "scheduled_btn"):
+            self.scheduled_btn.setStyleSheet(_with_tooltip_style(_tb_btn_css, light))
+        if hasattr(self, "ws_btn"):
+            self.ws_btn.setStyleSheet(
+                _with_tooltip_style(
+                    f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:11px;font-weight:500}}"
+                    f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
+                    light,
+                )
             )
         if hasattr(self, "file_sidebar"):
             self.file_sidebar.setStyleSheet("background:#f5f5f5;" if light else "background:transparent;")
@@ -358,7 +397,7 @@ class MainWindow(QMainWindow):
                     )
                 )
         in_settings = hasattr(self, "content_stack") and self.content_stack.currentIndex() == 1
-        for name in ("mode_btn", "_file_tree_toggle", "_session_toggle", "ws_btn", "ws_lbl", "_toolbar_spacer"):
+        for name in ("mode_btn", "_file_tree_toggle", "_session_toggle", "ws_btn", "_toolbar_spacer"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setVisible(not in_settings)
@@ -449,29 +488,28 @@ class MainWindow(QMainWindow):
         hover_bg = "rgba(0,0,0,0.06)" if light else "rgba(255,255,255,0.08)"
         dim = "#333333" if light else C_DIM
         hi_text = "#000000" if light else C_TEXT
-        self.ws_btn = QPushButton()
-        self.ws_btn.setFixedSize(34, 34)
-        self.ws_btn.setIcon(quark_icon("folder", 18))
-        self.ws_btn.setIconSize(QSize(18, 18))
+        self.ws_btn = QPushButton(self._ws_display(self.config.workspace))
+        self.ws_btn.setIcon(quark_icon("folder", 16))
+        self.ws_btn.setIconSize(QSize(16, 16))
+        self.ws_btn.setMinimumHeight(32)
         self.ws_btn.setStyleSheet(
             _with_tooltip_style(
-                f"QPushButton{{background:transparent;border:none;border-radius:8px}}QPushButton:hover{{background:{hover_bg}}}",
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:11px;font-weight:500}}"
+                f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
                 light,
             )
         )
-        self.ws_btn.setToolTip("Change workspace")
+        self.ws_btn.setToolTip(self.config.workspace or "Home")
         self.ws_btn.clicked.connect(self._chg_ws)
         tb.addWidget(self.ws_btn)
-        self.ws_lbl = QLabel(self._ws_display(self.config.workspace))
-        tb.addWidget(self.ws_lbl)
-        self.settings_btn = QPushButton("设置")
+        self.settings_btn = QPushButton("Settings")
         self.settings_btn.setIcon(quark_icon("settings", 16))
         self.settings_btn.setIconSize(QSize(16, 16))
         self.settings_btn.setMinimumHeight(32)
         self.settings_btn.clicked.connect(self._settings)
         self.settings_btn.setStyleSheet(
             _with_tooltip_style(
-                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px}}"
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px;font-weight:500}}"
                 f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
                 light,
             )
@@ -485,7 +523,7 @@ class MainWindow(QMainWindow):
         self.skills_btn.clicked.connect(self._show_skills_page)
         self.skills_btn.setStyleSheet(
             _with_tooltip_style(
-                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px}}"
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px;font-weight:500}}"
                 f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
                 light,
             )
@@ -499,26 +537,40 @@ class MainWindow(QMainWindow):
         self.metrics_btn.clicked.connect(self._show_metrics_page)
         self.metrics_btn.setStyleSheet(
             _with_tooltip_style(
-                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px}}"
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px;font-weight:500}}"
                 f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
                 light,
             )
         )
         tb.addWidget(self.metrics_btn)
         self.audit_btn = QPushButton("Audit")
-        self.audit_btn.setIcon(quark_icon("list", 16))
+        self.audit_btn.setIcon(quark_icon("shield", 16))
         self.audit_btn.setIconSize(QSize(16, 16))
         self.audit_btn.setMinimumHeight(32)
         self.audit_btn.setToolTip("会话审计")
         self.audit_btn.clicked.connect(self._show_audit_page)
         self.audit_btn.setStyleSheet(
             _with_tooltip_style(
-                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px}}"
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px;font-weight:500}}"
                 f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
                 light,
             )
         )
         tb.addWidget(self.audit_btn)
+        self.scheduled_btn = QPushButton("Scheduled")
+        self.scheduled_btn.setIcon(quark_icon("clock", 16))
+        self.scheduled_btn.setIconSize(QSize(16, 16))
+        self.scheduled_btn.setMinimumHeight(32)
+        self.scheduled_btn.setToolTip("定时任务")
+        self.scheduled_btn.clicked.connect(self._show_scheduled_page)
+        self.scheduled_btn.setStyleSheet(
+            _with_tooltip_style(
+                f"QPushButton{{background:transparent;border:none;border-radius:8px;padding:0 10px;color:{dim};font-size:12px;font-weight:500}}"
+                f"QPushButton:hover{{background:{hover_bg};color:{hi_text}}}",
+                light,
+            )
+        )
+        tb.addWidget(self.scheduled_btn)
         r.addWidget(tb)
 
         # Splitter
@@ -612,6 +664,8 @@ class MainWindow(QMainWindow):
         self.content_stack.addWidget(self.audit_panel)
         self.skills_panel = SkillsPanel(self.config, self)
         self.content_stack.addWidget(self.skills_panel)
+        self.scheduled_panel = ScheduledTasksPanel(self.config, self)
+        self.content_stack.addWidget(self.scheduled_panel)
         self.content_stack.setCurrentIndex(0)
         self._sync_settings_toolbar_button()
         r.addWidget(self.content_stack, 1)
@@ -873,8 +927,9 @@ class MainWindow(QMainWindow):
     def _on_file(self, path):
         self.editor_tabs.open_file(path)
         self.slbl.setText(f"Opened: {Path(path).name}")
-        self.chat.set_kscc_status(f"Current file: {Path(path).name}")
-        QTimer.singleShot(8000, lambda: self.chat.set_kscc_status(""))
+        sid = self._cur_session.id if self._cur_session else ""
+        self._set_session_chat_status(sid, f"Current file: {Path(path).name}")
+        QTimer.singleShot(8000, lambda _sid=sid: self._set_session_chat_status(_sid, ""))
         try:
             content = Path(path).read_text("utf-8", errors="replace")[:500]
             self.chat.add_message("tool", f"File · {Path(path).name}\n```\n{content}\n```")
@@ -905,7 +960,7 @@ class MainWindow(QMainWindow):
             self.config.workspace = ap
             save_config(self.config)
             os.chdir(ap)
-            self.ws_lbl.setText(self._ws_display(ap))
+            self._set_workspace_display(ap)
             self.file_tree.set_workspace(ap)
 
     def _ws_display(self, ws: str) -> str:
@@ -914,6 +969,13 @@ class MainWindow(QMainWindow):
         if ws and os.path.normcase(os.path.normpath(ws)) == os.path.normcase(os.path.normpath(home)):
             return "Home"
         return self._short(ws, 30)
+
+    def _set_workspace_display(self, ws: str):
+        label = self._ws_display(ws)
+        tooltip = ws or "Home"
+        if hasattr(self, "ws_btn"):
+            self.ws_btn.setText(label)
+            self.ws_btn.setToolTip(tooltip)
 
     @staticmethod
     def _short(t, n):
@@ -1073,7 +1135,7 @@ class MainWindow(QMainWindow):
             target_ws = home
         if target_ws and os.path.isdir(target_ws):
             self.config.workspace = os.path.abspath(target_ws)
-            self.ws_lbl.setText(self._ws_display(self.config.workspace))
+            self._set_workspace_display(self.config.workspace)
             self.file_tree.set_workspace(self.config.workspace)
         mode = self.config.mode
         session = self.store.create(title="", workspace=target_ws or home, mode=mode)
@@ -1095,6 +1157,90 @@ class MainWindow(QMainWindow):
                 if isinstance(part, dict) and part.get("type") == "text":
                     return Agent.strip_skill_augmentation(str(part.get("text", "")))
         return Agent.strip_skill_augmentation(str(content or ""))
+
+    @staticmethod
+    def _normalize_saved_messages(messages: list[dict]) -> list[dict]:
+        """Normalize messages for persistence to avoid duplicate/empty bubbles on reload."""
+        out: list[dict] = []
+        prev_user_text = None
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content", "")
+
+            # Drop empty assistant messages (often streaming placeholders) if they contain no content.
+            if role == "assistant":
+                txt = ""
+                if isinstance(content, str):
+                    txt = content.strip()
+                elif isinstance(content, list):
+                    # best-effort extract text parts
+                    txt = "\n".join(str(p.get("text", "")).strip() for p in content if isinstance(p, dict) and p.get("type") == "text").strip()
+                if not txt:
+                    continue
+
+                # Merge consecutive assistant messages so reload matches runtime "single streaming bubble".
+                if out and isinstance(out[-1], dict) and out[-1].get("role") == "assistant":
+                    prev = out[-1]
+                    prev_c = prev.get("content", "")
+                    if isinstance(prev_c, str) and isinstance(content, str):
+                        sep = "\n\n" if (prev_c and not prev_c.endswith("\n")) else "\n"
+                        prev["content"] = (prev_c + sep + content).strip()
+                    else:
+                        # Fallback: keep as separate if content is non-string.
+                        pass
+                    # Preserve tool_calls if any (diff restore relies on edit_file calls).
+                    try:
+                        ptc = prev.get("tool_calls", []) or []
+                        ntc = m.get("tool_calls", []) or []
+                        if isinstance(ptc, list) and isinstance(ntc, list) and ntc:
+                            prev["tool_calls"] = list(ptc) + list(ntc)
+                    except Exception:
+                        pass
+                    continue
+
+            # De-duplicate consecutive identical user prompts (common in task mode: plan+execute each append).
+            if role == "user":
+                if isinstance(content, str):
+                    txt = content.strip()
+                elif isinstance(content, list):
+                    txt = "\n".join(str(p.get("text", "")).strip() for p in content if isinstance(p, dict) and p.get("type") == "text").strip()
+                else:
+                    txt = str(content or "").strip()
+                if prev_user_text is not None and txt and txt == prev_user_text:
+                    continue
+                prev_user_text = txt
+            else:
+                prev_user_text = None
+
+            out.append(m)
+        return out
+
+    def _persist_user_message_snapshot(self, text: str, attachments: list | None = None):
+        """Persist the just-sent user message immediately to avoid loss on session switch."""
+        if not self._cur_session:
+            return
+        snap = {
+            "role": "user",
+            "content": str(text or ""),
+            "display_text": str(text or ""),
+            "attachments": [dict(a) for a in (attachments or [])],
+        }
+        msgs = list(self._cur_session.messages or [])
+        # De-duplicate same tail message (can happen on retries/re-entrant send paths).
+        if msgs:
+            last = msgs[-1]
+            if (
+                isinstance(last, dict)
+                and last.get("role") == "user"
+                and str(last.get("display_text", last.get("content", "")) or "") == snap["display_text"]
+                and (last.get("attachments") or []) == snap["attachments"]
+            ):
+                return
+        msgs.append(snap)
+        self._cur_session.messages = msgs
+        self.store.save(self._cur_session)
 
     @staticmethod
     def _is_task_internal_prompt_message(msg: dict) -> bool:
@@ -1128,7 +1274,7 @@ class MainWindow(QMainWindow):
         w.tool_call.connect(lambda n, p, _sid=sid: self._on_tool_call_status(n, p) if self._is_current_session(_sid) else None)
         w.tool_result.connect(lambda r, err=False, _sid=sid: self._on_tool_result_status(r, err) if self._is_current_session(_sid) else None)
         w.diff_preview.connect(lambda p, o, n, _sid=sid: self.chat.add_diff(p, o, n) if self._is_current_session(_sid) else None)
-        w.kscc_status.connect(lambda s, _sid=sid: self.chat.set_kscc_status(s) if self._is_current_session(_sid) else None)
+        w.kscc_status.connect(lambda s, _sid=sid: self._set_session_chat_status(_sid, s))
         w.confirm_request.connect(lambda path, old, new, _sid=sid: self._on_confirm(path, old, new, _sid))
         w.context_info.connect(lambda j, _sid=sid: self._on_ctx(j) if self._is_current_session(_sid) else None)
         w.skill_info.connect(lambda p, _sid=sid: self._on_skill_info(p) if self._is_current_session(_sid) else None)
@@ -1216,6 +1362,8 @@ class MainWindow(QMainWindow):
         self._refresh_sessions()
         self.editor_tabs.clear_all_tabs()
         self.chat.clear_messages()
+        # Restore per-session composer status (avoid leaking previous session's status).
+        self.chat.set_kscc_status(self._session_chat_status.get(sid, ""))
         # Choose message source: live agent.messages if running, else session.messages
         agent = self._agents.get(sid)
         if self._running and agent and agent.messages:
@@ -1246,7 +1394,12 @@ class MainWindow(QMainWindow):
                             if a.get("path"):
                                 self.chat.add_diff(a["path"], a.get("old_string", ""), a.get("new_string", ""))
                 elif r == "tool":
+                    # Match runtime behavior: do not render tool role bubbles during session restore.
+                    # Tool activity is surfaced via status bar and diff cards (and/or assistant text).
                     pass
+                elif r == "error":
+                    if c:
+                        self.chat.add_message("error", str(c), render_markdown=False)
         finally:
             self.chat.end_bulk_restore()
         # If this session is still running, show streaming state
@@ -1263,7 +1416,7 @@ class MainWindow(QMainWindow):
             self.chat.set_mode_switch_locked(False)
         if session.workspace and os.path.isdir(session.workspace):
             self.config.workspace = os.path.abspath(session.workspace)
-            self.ws_lbl.setText(self._ws_display(self.config.workspace))
+            self._set_workspace_display(self.config.workspace)
             self.file_tree.set_workspace(self.config.workspace)
         if session.backend:
             self.config.backend = str(session.backend)
@@ -1333,11 +1486,12 @@ class MainWindow(QMainWindow):
         self.chat.show_save_skill_prompt(False)
         self.editor_tabs.clear_all_tabs()
         self.chat.clear_messages()
+        self.chat.set_kscc_status("")
         # Reset workspace to Home (user home directory)
         home = os.path.expanduser("~")
         self.config.workspace = home
         os.chdir(home)
-        self.ws_lbl.setText("Home")
+        self._set_workspace_display(home)
         self.file_tree.set_workspace(home)
         self._refresh_sessions()
         self.slbl.setText("New session")
@@ -1413,6 +1567,7 @@ class MainWindow(QMainWindow):
             "display_text": prompt,
             "attachments": [dict(a) for a in attachments_meta],
         }
+        self._persist_user_message_snapshot(prompt, attachments_meta)
         if switched_runtime and self._cur_session is not None:
             evt = {
                 "ts": datetime.now().isoformat(timespec="seconds"),
@@ -1572,10 +1727,13 @@ class MainWindow(QMainWindow):
             session = self.store.load(sid)
         if session and agent and agent.messages:
             # Filter out internal task executor messages before saving
-            session.messages = [
+            # Match runtime UI behavior: tool role messages are not part of the visible chat stream.
+            session.messages = self._normalize_saved_messages([
                 m for m in agent.messages
-                if (not m.get("_internal")) and (not self._is_task_internal_prompt_message(m))
-            ]
+                if (not m.get("_internal"))
+                and (not self._is_task_internal_prompt_message(m))
+                and (m.get("role") != "tool")
+            ])
             # Strip skill augmentation from user messages for clean display on reload
             for msg in session.messages:
                 if msg.get("role") == "user":
@@ -1726,6 +1884,8 @@ class MainWindow(QMainWindow):
                     if step.status != StepStatus.SUCCESS:
                         step.mark_success(StepResult(success=True, output="Completed"))
                 self.task_panel.update_task_state(task_state)
+                # 添加到历史列表
+                self.task_panel.add_to_history(task_state)
 
     def _on_task_failed(self, task_id, error, sid=None):
         is_current = sid and self._cur_session and sid == self._cur_session.id
@@ -1740,6 +1900,8 @@ class MainWindow(QMainWindow):
                 task_state = task_exec.get_current_task()
                 if task_state:
                     self.task_panel.show_resume(task_state)
+                    # 添加到历史列表
+                    self.task_panel.add_to_history(task_state)
 
     def _on_task_resume(self, task_id, goal, resume_info):
         plan = resume_info.get("plan", "")
@@ -1954,10 +2116,13 @@ class MainWindow(QMainWindow):
         if not self._cur_session or not self._agent or not self._agent.messages:
             return
         # Filter out internal task executor messages before saving
-        self._cur_session.messages = [
+        # Match runtime UI behavior: tool role messages are not part of the visible chat stream.
+        self._cur_session.messages = self._normalize_saved_messages([
             m for m in self._agent.messages
-            if (not m.get("_internal")) and (not self._is_task_internal_prompt_message(m))
-        ]
+            if (not m.get("_internal"))
+            and (not self._is_task_internal_prompt_message(m))
+            and (m.get("role") != "tool")
+        ])
         # Strip skill augmentation from user messages for clean display on reload
         for msg in self._cur_session.messages:
             if msg.get("role") == "user":
@@ -2022,18 +2187,23 @@ class MainWindow(QMainWindow):
             self.content_stack.setCurrentIndex(4)
         self._sync_settings_toolbar_button()
 
+    def _show_scheduled_page(self):
+        if hasattr(self, "content_stack"):
+            self.content_stack.setCurrentIndex(5)
+        self._sync_settings_toolbar_button()
+
     def _sync_settings_toolbar_button(self):
         if not hasattr(self, "settings_btn") or not hasattr(self, "content_stack"):
             return
         idx = self.content_stack.currentIndex()
         if idx != 0:
-            self.settings_btn.setText("返回")
+            self.settings_btn.setText("Back")
             self.settings_btn.setIcon(quark_icon("arrow_left", 18))
-            self.settings_btn.setToolTip("返回")
+            self.settings_btn.setToolTip("Back")
         else:
-            self.settings_btn.setText("设置")
+            self.settings_btn.setText("Settings")
             self.settings_btn.setIcon(quark_icon("settings", 18))
-            self.settings_btn.setToolTip("设置")
+            self.settings_btn.setToolTip("Settings")
         if hasattr(self, "sbar"):
             self.sbar.setVisible(idx == 0)
         self._sync_shell_chrome()
@@ -2070,6 +2240,73 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    # NOTE: scheduler handlers are defined above; keep a single implementation.
+
+    def _execute_scheduled_task(self, task_name: str, prompt: str):
+        """Execute a scheduled task by creating a new agent and worker."""
+        self._scheduler.mark_task_running(task_name)
+        # Create a dedicated background session for this scheduled run.
+        session = self.store.create(title=f"[定时] {task_name}", workspace=self.config.workspace, mode="solo")
+        sid = session.id
+        self._session_run_state[sid] = "running"
+        session.workspace = os.path.abspath(self.config.workspace)
+        session.backend = self.config.backend or "openai"
+        session.model = self.config.openai_active or ""
+        self.store.save(session)
+        self._refresh_sessions()
+
+        try:
+            agent = Agent(config=self.config, mode="solo")
+        except Exception as e:
+            self._scheduler.mark_task_run(task_name, "failed")
+            self._scheduler.save_report(task_name, f"执行失败: {e}")
+            return
+
+        self._agents[sid] = agent
+
+        # Run scheduled tasks through the normal AgentWorker path so messages persist the same way
+        # as regular chats (TaskExecutor marks messages as _internal and would save an empty session).
+        w = AgentWorker(agent, str(prompt or ""), [])
+        self._workers[sid] = w
+
+        # Connect signals for scheduled task completion
+        w.finished.connect(lambda: self._on_scheduled_task_finished(task_name, sid))
+        w.error.connect(lambda err: self._on_scheduled_task_error(task_name, sid, err))
+
+        # Connect standard signals for persistence and (when opened) UI updates.
+        self._connect_worker_signals(w, sid, is_task_worker=False)
+
+        if hasattr(self, "slbl"):
+            self.slbl.setText(f"执行定时任务: {task_name}...")
+        w.start()
+
+    def _on_scheduled_task_finished(self, task_name: str, sid: str):
+        """Called when a scheduled task finishes successfully."""
+        self._scheduler.mark_task_run(task_name, "ok")
+        # Save report
+        agent = self._agents.get(sid)
+        if agent and agent.messages:
+            last = agent.messages[-1]
+            content = last.get("content", "") if isinstance(last, dict) else ""
+            if content:
+                self._scheduler.save_report(task_name, content)
+        self._process_pending_scheduled()
+
+    def _on_scheduled_task_error(self, task_name: str, sid: str, error: str):
+        """Called when a scheduled task fails."""
+        self._scheduler.mark_task_run(task_name, "failed")
+        self._scheduler.save_report(task_name, f"执行失败: {error}")
+        self._process_pending_scheduled()
+
+    def _process_pending_scheduled(self):
+        """Process next queued scheduled task if any."""
+        pending = getattr(self, '_pending_scheduled', [])
+        if pending:
+            next_name, next_prompt = pending.pop(0)
+            QTimer.singleShot(2000, lambda: self._execute_scheduled_task(next_name, next_prompt))
+        # Refresh session list indicators after completion/queue drain.
+        self._refresh_sessions()
+
     def _sync_browser_driver(self):
         """Sync browser driver state with the feature flag."""
         try:
@@ -2095,6 +2332,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._stop_browser_driver()
+        try:
+            if getattr(self, "_scheduler", None) is not None:
+                self._scheduler.stop()
+        except Exception:
+            pass
         event.accept()
 
 

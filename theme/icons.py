@@ -113,6 +113,11 @@ def quark_icon(kind: str, size: int = 18, fg: Optional[str] = None) -> QIcon:
             cy = int(w * (0.30 + i * 0.20))
             p.drawEllipse(QRectF(w * 0.18, cy - w * 0.05, w * 0.10, w * 0.10))
             p.drawLine(int(w * 0.36), cy, int(w * 0.82), cy)
+    elif kind == "clock":
+        cx, cy, r = w * 0.50, w * 0.50, w * 0.32
+        p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
+        p.drawLine(int(cx), int(cy), int(cx), int(cy - r * 0.65))
+        p.drawLine(int(cx), int(cy), int(cx + r * 0.50), int(cy))
 
     p.end()
     return QIcon(pm)

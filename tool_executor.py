@@ -152,6 +152,28 @@ register_tool(ToolMeta(
     description="搜索外部 Skill 库（105K+ 技能卡）",
 ))
 
+# Scheduled task tools
+register_tool(ToolMeta(
+    name="create_scheduled_task", category=ToolCategory.FILE, risk=RiskLevel.LOW,
+    read_only=False, needs_workspace=False,
+    description="创建定时任务",
+))
+register_tool(ToolMeta(
+    name="list_scheduled_tasks", category=ToolCategory.FILE, risk=RiskLevel.SAFE,
+    read_only=True, needs_workspace=False,
+    description="列出定时任务",
+))
+register_tool(ToolMeta(
+    name="update_scheduled_task", category=ToolCategory.FILE, risk=RiskLevel.LOW,
+    read_only=False, needs_workspace=False,
+    description="更新定时任务",
+))
+register_tool(ToolMeta(
+    name="delete_scheduled_task", category=ToolCategory.FILE, risk=RiskLevel.LOW,
+    read_only=False, needs_workspace=False,
+    description="删除定时任务",
+))
+
 # P4-5: 敏感任务风控模板
 RISK_TEMPLATES: dict[str, dict] = {
     "payment": {
@@ -336,6 +358,12 @@ class ToolExecutor:
             # Skill search tool (no feature gate)
             if name == "skill_search":
                 dispatch["skill_search"] = self._skill_search
+            # Scheduled task tools (no feature gate)
+            if name in ("create_scheduled_task", "list_scheduled_tasks", "update_scheduled_task", "delete_scheduled_task"):
+                dispatch["create_scheduled_task"] = self._create_scheduled_task
+                dispatch["list_scheduled_tasks"] = self._list_scheduled_tasks
+                dispatch["update_scheduled_task"] = self._update_scheduled_task
+                dispatch["delete_scheduled_task"] = self._delete_scheduled_task
             handler = dispatch.get(name)
             if handler:
                 return handler(args)
@@ -381,6 +409,14 @@ class ToolExecutor:
             return f"Launch Chrome{' → ' + url if url else ''}"
         elif name == "skill_search":
             return f"Skill Search: {args.get('query', '')}"
+        elif name == "create_scheduled_task":
+            return f"Create Task: {args.get('name', '')} @ {args.get('schedule', '')}"
+        elif name == "list_scheduled_tasks":
+            return "List scheduled tasks"
+        elif name == "update_scheduled_task":
+            return f"Update Task: {args.get('name', '')}"
+        elif name == "delete_scheduled_task":
+            return f"Delete Task: {args.get('name', '')}"
         return f"{name}: {json.dumps(args, ensure_ascii=False)[:100]}"
 
     # ── 工具实现 ──
@@ -788,6 +824,74 @@ class ToolExecutor:
             return f"ToolError: Skill 搜索失败 - {e}"
         except Exception as e:
             return f"ToolError: Skill 搜索异常 - {e}"
+
+    # ── Scheduled Task tools ──
+
+    def _get_scheduler(self):
+        """Get the TaskScheduler instance from the config or app."""
+        # The scheduler is attached to config by app.py during init
+        sched = getattr(self._config, '_scheduler', None)
+        if sched is None:
+            return None
+        return sched
+
+    def _create_scheduled_task(self, args: dict) -> str:
+        scheduler = self._get_scheduler()
+        if not scheduler:
+            return "ToolError: 定时任务调度器未初始化。"
+        name = args.get("name", "").strip()
+        schedule = args.get("schedule", "").strip()
+        prompt = args.get("prompt", "").strip()
+        if not name or not schedule or not prompt:
+            return "ToolError: name, schedule, prompt 参数不能为空。"
+        # Validate schedule format
+        if ":" not in schedule:
+            return "ToolError: schedule 格式应为 HH:MM（如 '09:00'）。"
+        repeat = args.get("repeat", "daily")
+        max_delay = args.get("max_delay_hours", 6)
+        try:
+            task = scheduler.create_task(name=name, schedule=schedule, prompt=prompt, repeat=repeat, max_delay_hours=max_delay)
+            return f"定时任务已创建: [{task.name}]\n  触发时间: {task.schedule} ({task.repeat})\n  指令: {task.prompt[:80]}"
+        except Exception as e:
+            return f"ToolError: 创建定时任务失败 - {e}"
+
+    def _list_scheduled_tasks(self, args: dict) -> str:
+        scheduler = self._get_scheduler()
+        if not scheduler:
+            return "ToolError: 定时任务调度器未初始化。"
+        from scheduler import format_task_list
+        tasks = scheduler.list_tasks()
+        return format_task_list(tasks)
+
+    def _update_scheduled_task(self, args: dict) -> str:
+        scheduler = self._get_scheduler()
+        if not scheduler:
+            return "ToolError: 定时任务调度器未初始化。"
+        name = args.get("name", "").strip()
+        if not name:
+            return "ToolError: name 参数不能为空。"
+        kwargs = {}
+        for key in ("enabled", "schedule", "prompt", "repeat", "max_delay_hours"):
+            if key in args:
+                kwargs[key] = args[key]
+        if not kwargs:
+            return "ToolError: 至少需要一个更新字段（enabled/schedule/prompt/repeat/max_delay_hours）。"
+        task = scheduler.update_task(name, **kwargs)
+        if not task:
+            return f"ToolError: 未找到名为 '{name}' 的定时任务。"
+        status = "已启用" if task.enabled else "已禁用"
+        return f"定时任务已更新: [{task.name}] {status}\n  触发时间: {task.schedule} ({task.repeat})"
+
+    def _delete_scheduled_task(self, args: dict) -> str:
+        scheduler = self._get_scheduler()
+        if not scheduler:
+            return "ToolError: 定时任务调度器未初始化。"
+        name = args.get("name", "").strip()
+        if not name:
+            return "ToolError: name 参数不能为空。"
+        if scheduler.delete_task(name):
+            return f"定时任务已删除: {name}"
+        return f"ToolError: 未找到名为 '{name}' 的定时任务。"
 
     @staticmethod
     def _html_to_text(html_text: str) -> str:

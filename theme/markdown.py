@@ -286,7 +286,10 @@ def md_chat_to_html(text: str, light: bool = False) -> str:
     t = re.sub(r"\n{2,}", "\n", t)
     t = t.replace("\n", "<br>")
     t = re.sub(r"<br>\s*<ul", "<ul", t)
+    t = re.sub(r"<br>\s*</ul>", "</ul>", t)
     t = re.sub(r"</ul>\s*<br>", "</ul>", t)
+    # Remove <br> between list items; otherwise Qt adds large gaps.
+    t = re.sub(r"</li>\s*<br>\s*<li", "</li><li", t)
     t = re.sub(r"(?:<br>\s*){2,}", "<br>", t)
     for key, html in code_blocks.items():
         t = t.replace(key, html)

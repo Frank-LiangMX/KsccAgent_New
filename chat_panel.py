@@ -237,6 +237,8 @@ class ChatPanel(QWidget):
         self._diff_cards: dict[str, dict] = {}
         self._empty_mode = False
         self._bulk_restore = False
+        self._deferred_render_bubbles = []
+        self._deferred_render_running = False
         self._task_mode_enabled = False
         self._mode_switch_locked = False
         l = QVBoxLayout(self)
@@ -267,6 +269,11 @@ class ChatPanel(QWidget):
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        try:
+            # Lazy-render deferred markdown when the user scrolls into history.
+            self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
+        except Exception:
+            pass
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.viewport().setStyleSheet("background:transparent;")
         self.msg_container = QWidget()
@@ -607,6 +614,8 @@ class ChatPanel(QWidget):
 
     def begin_bulk_restore(self):
         self._bulk_restore = True
+        self._deferred_render_bubbles = []
+        self._deferred_render_running = False
         self._stream_bubble = None
         self.scroll.hide()
         self.msg_container.setUpdatesEnabled(False)
@@ -623,6 +632,159 @@ class ChatPanel(QWidget):
         self.msg_container.adjustSize()
         QTimer.singleShot(0, self._adjust_input_height)
         QTimer.singleShot(0, self._scroll)
+        # Render a small tail quickly; then keep draining the rest in the background.
+        self._kick_deferred_renders(initial_only=True)
+        self._schedule_deferred_render()
+        self._update_deferred_status()
+
+    def _kick_deferred_renders(self, initial_only: bool = False):
+        """
+        Render a small number of deferred assistant bubbles immediately.
+        The remaining bubbles are drained by _schedule_deferred_render().
+        """
+        if not self._deferred_render_bubbles:
+            return
+        n = 24 if initial_only else 12
+        # Bubbles are appended in visual order; render from the end (newest-first).
+        batch = []
+        for _ in range(min(n, len(self._deferred_render_bubbles))):
+            batch.append(self._deferred_render_bubbles.pop())
+        for b in batch:
+            try:
+                b.enable_markdown_render()
+            except Exception:
+                pass
+
+    def _schedule_deferred_render(self):
+        """Drain deferred renders in small batches without blocking the UI thread."""
+        if self._bulk_restore:
+            return
+        if self._deferred_render_running:
+            return
+        if not self._deferred_render_bubbles:
+            return
+        self._deferred_render_running = True
+
+        def step():
+            if self._bulk_restore:
+                self._deferred_render_running = False
+                return
+            if not self._deferred_render_bubbles:
+                self._deferred_render_running = False
+                self._update_deferred_status(done=True)
+                return
+            # Render a modest batch near the current viewport; keep scroll stable.
+            self._render_deferred_near_viewport(batch_size=12)
+            self._update_deferred_status()
+            QTimer.singleShot(10, step)
+
+        QTimer.singleShot(0, step)
+
+    def _update_deferred_status(self, done: bool = False):
+        try:
+            left = len(self._deferred_render_bubbles or [])
+            if done:
+                left = 0
+            # Avoid spamming; only update when there is pending work.
+            if left > 0:
+                self.set_kscc_status(f"Rendering history… {left}")
+            else:
+                # Clear status if we previously showed it.
+                if str(getattr(self, "_status_base_text", "") or "").startswith("Rendering history"):
+                    self.set_kscc_status("")
+        except Exception:
+            pass
+
+    def _render_deferred_near_viewport(self, batch_size: int = 12):
+        if not self._deferred_render_bubbles:
+            return
+
+        # Anchor the first visible message so height changes don't "jump" the scroll position.
+        sb = self.scroll.verticalScrollBar()
+        before_val = int(sb.value())
+        anchor = self._find_anchor_bubble()
+        anchor_y_before = None
+        if anchor is not None:
+            try:
+                anchor_y_before = int(anchor.mapTo(self.msg_container, QPoint(0, 0)).y())
+            except Exception:
+                anchor_y_before = None
+
+        batch = self._pick_deferred_batch_near_viewport(batch_size=batch_size)
+        for b in batch:
+            try:
+                b.enable_markdown_render()
+            except Exception:
+                pass
+
+        if anchor is not None and anchor_y_before is not None:
+            try:
+                anchor_y_after = int(anchor.mapTo(self.msg_container, QPoint(0, 0)).y())
+                delta = anchor_y_after - anchor_y_before
+                if delta:
+                    sb.setValue(int(before_val + delta))
+            except Exception:
+                pass
+
+    def _find_anchor_bubble(self):
+        """Return a ChatBubble near the top of the viewport to anchor scroll position."""
+        try:
+            vp = self.scroll.viewport()
+            top_left = vp.mapTo(self.msg_container, QPoint(0, 0))
+            # Sample a point slightly below the top to avoid picking margins.
+            p = QPoint(20, max(0, top_left.y() + 8))
+            w = self.msg_container.childAt(p)
+            # childAt may return a nested widget; walk up to ChatBubble.
+            while w is not None and not isinstance(w, ChatBubble):
+                w = w.parentWidget()
+            return w
+        except Exception:
+            return None
+
+    def _pick_deferred_batch_near_viewport(self, batch_size: int = 12):
+        """Pick and remove a batch of deferred bubbles closest to the viewport."""
+        if not self._deferred_render_bubbles:
+            return []
+        try:
+            vp = self.scroll.viewport()
+            tl = vp.mapTo(self.msg_container, QPoint(0, 0))
+            br = vp.mapTo(self.msg_container, QPoint(vp.width(), vp.height()))
+            top = int(tl.y())
+            bottom = int(br.y())
+        except Exception:
+            # Fallback: render newest-first
+            batch = []
+            for _ in range(min(batch_size, len(self._deferred_render_bubbles))):
+                batch.append(self._deferred_render_bubbles.pop())
+            return batch
+
+        center = (top + bottom) * 0.5
+        # Expand target range so we pre-render a little above/below the viewport.
+        pad = max(300, int((bottom - top) * 0.8))
+        target_top = top - pad
+        target_bottom = bottom + pad
+
+        scored = []
+        for i, b in enumerate(self._deferred_render_bubbles):
+            try:
+                g = b.geometry()
+                mid = float(g.y() + g.height() * 0.5)
+            except Exception:
+                mid = float(i)
+            in_band = 0 if (target_top <= mid <= target_bottom) else 1
+            dist = abs(mid - center)
+            scored.append((in_band, dist, i))
+
+        scored.sort()
+        pick_indices = [i for (_band, _dist, i) in scored[: min(batch_size, len(scored))]]
+        pick_indices.sort(reverse=True)
+        batch = []
+        for i in pick_indices:
+            try:
+                batch.append(self._deferred_render_bubbles.pop(i))
+            except Exception:
+                pass
+        return batch[::-1]
 
     def set_empty_context(self, workspace: str = "", title: str = "Start a new session", subtitle: str = ""):
         self._empty_workspace_lbl.setText("KsccUI")
@@ -985,18 +1147,31 @@ class ChatPanel(QWidget):
 
     def add_message(self, role, text, attachments: Optional[list[dict]] = None, model_label: str = "", render_markdown: bool = True):
         self.set_empty_state(False)
+        # Only defer assistant markdown; tool messages should match runtime rendering immediately.
+        deferred = self._bulk_restore and (role == "assistant") and bool(render_markdown)
         b = ChatBubble(
             role,
             text,
             scroll_area=self.scroll,
             attachments=attachments,
             model_label=model_label,
-            render_markdown=render_markdown,
+            render_markdown=(False if deferred else render_markdown),
         )
         self.msg_layout.insertWidget(max(0, self.msg_layout.count() - 1), b)
+        if deferred:
+            self._deferred_render_bubbles.append(b)
         if not self._bulk_restore:
             QTimer.singleShot(30, self._scroll)
         return b
+
+    def _on_scroll_value_changed(self, _v: int):
+        # If there are deferred bubbles left, render a few on scroll so the visible region
+        # gradually becomes fully formatted without blocking initial load.
+        if self._bulk_restore:
+            return
+        if self._deferred_render_bubbles:
+            # Start/continue the background drain; don't rely on a single scroll event.
+            self._schedule_deferred_render()
 
     def start_stream(self, model_label: str = ""):
         self._stream_bubble = self.add_message("assistant", "", model_label=model_label)

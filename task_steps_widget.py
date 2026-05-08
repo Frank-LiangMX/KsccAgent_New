@@ -336,7 +336,6 @@ class TaskStepsPanel(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFrameShadow(QFrame.Shadow.Raised)
         self._setup_ui()
-        self._loaded_history = False
         self._resumable_state = None  # 可恢复的任务状态
 
     def _setup_ui(self):
@@ -367,35 +366,40 @@ class TaskStepsPanel(QFrame):
         self._progress_widget = TaskProgressWidget()
         layout.addWidget(self._progress_widget, 1)
 
-        # 历史任务栏
-        self._history_bar = QFrame()
-        self._history_bar.setFrameShape(QFrame.Shape.StyledPanel)
-        self._history_bar.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._history_bar.setStyleSheet("""
-            QFrame {
-                background-color: #F3F4F6;
-                border: 1px solid #E5E7EB;
-                border-radius: 4px;
-                padding: 6px;
+        # 历史任务面板（可折叠列表）
+        self._history_panel = QWidget()
+        history_panel_layout = QVBoxLayout(self._history_panel)
+        history_panel_layout.setContentsMargins(0, 0, 0, 0)
+        history_panel_layout.setSpacing(2)
+
+        self._history_toggle_btn = QToolButton()
+        self._history_toggle_btn.setText("▶ History (0)")
+        self._history_toggle_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._history_toggle_btn.setArrowType(Qt.ArrowType.NoArrow)
+        self._history_toggle_btn.setStyleSheet("""
+            QToolButton {
+                border: none;
+                color: #9CA3AF;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 4px 0;
+                text-align: left;
             }
-            QFrame:hover {
-                background-color: #E5E7EB;
-            }
+            QToolButton:hover { color: #60A5FA; }
         """)
-        history_layout = QHBoxLayout(self._history_bar)
-        history_layout.setContentsMargins(8, 6, 8, 6)
-        history_layout.setSpacing(8)
+        self._history_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._history_toggle_btn.clicked.connect(self._toggle_history)
+        history_panel_layout.addWidget(self._history_toggle_btn)
 
-        self._history_icon = QLabel("⏱")
-        history_layout.addWidget(self._history_icon)
+        self._history_container = QWidget()
+        self._history_container.setVisible(False)
+        self._history_list_layout = QVBoxLayout(self._history_container)
+        self._history_list_layout.setContentsMargins(0, 0, 0, 0)
+        self._history_list_layout.setSpacing(2)
+        history_panel_layout.addWidget(self._history_container)
 
-        self._history_label = QLabel("No recent tasks")
-        self._history_label.setFont(QFont("", 9))
-        self._history_label.setWordWrap(True)
-        history_layout.addWidget(self._history_label, 1)
-
-        self._history_bar.mousePressEvent = self._on_history_clicked
-        layout.addWidget(self._history_bar)
+        self._history_items: list[dict] = []  # [{state, widget}]
+        layout.addWidget(self._history_panel)
 
         # 恢复按钮（默认隐藏，任务失败后显示）
         self._resume_btn = QToolButton()
@@ -431,44 +435,109 @@ class TaskStepsPanel(QFrame):
     def _scan_history(self):
         """扫描最近的历史任务日志"""
         try:
-            from task_logger import get_latest_task_log, load_task_state_from_log
-            latest = get_latest_task_log()
-            if latest:
-                state = load_task_state_from_log(latest)
-                if state:
-                    total = len(state.steps)
-                    completed = len(state.get_completed_steps())
-                    failed = len(state.get_failed_steps())
-                    goal_short = state.goal[:40] + ("..." if len(state.goal) > 40 else "")
-                    self._history_label.setText(
-                        f"Last: {goal_short}\n{total} steps, {completed} ok, {failed} failed"
-                    )
-                    self._history_bar._log_path = str(latest)
-                    self._history_bar._task_state = state
-                    self._history_bar.show()
-                    self._loaded_history = True
-                else:
-                    self._history_bar.hide()
-            else:
-                self._history_bar.hide()
+            from task_logger import get_recent_task_logs, load_task_state_from_log
+            logs = get_recent_task_logs(limit=20)
+            for log_path in logs:
+                state = load_task_state_from_log(log_path)
+                if state and state.steps:
+                    self.add_to_history(state)
         except Exception:
-            self._history_bar.hide()
+            pass
 
-    def _on_history_clicked(self, event=None):
-        """点击历史任务栏，加载并显示历史任务"""
-        state = getattr(self._history_bar, '_task_state', None)
-        if state:
-            self._progress_widget.update_task_state(state)
-            self._status_label.setText(
-                f"History: task {state.task_id} - {state.phase.value.title()}"
-            )
+    def _toggle_history(self):
+        """展开/折叠历史列表"""
+        visible = not self._history_container.isVisible()
+        self._history_container.setVisible(visible)
+        self._update_history_toggle_text()
+
+    def _update_history_toggle_text(self):
+        """更新历史按钮文本"""
+        count = len(self._history_items)
+        arrow = "▼" if self._history_container.isVisible() else "▶"
+        self._history_toggle_btn.setText(f"{arrow} History ({count})")
+
+    def _create_history_item(self, state: TaskState) -> QFrame:
+        """创建单个历史任务条目"""
+        item = QFrame()
+        item.setCursor(Qt.CursorShape.PointingHandCursor)
+        item.setStyleSheet("""
+            QFrame {
+                background-color: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.06);
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QFrame:hover {
+                background-color: rgba(59,130,246,0.1);
+                border-color: rgba(59,130,246,0.3);
+            }
+        """)
+        layout = QHBoxLayout(item)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(8)
+
+        # 状态图标
+        total = len(state.steps)
+        completed = len(state.get_completed_steps())
+        failed = len(state.get_failed_steps())
+        if failed > 0:
+            icon_text = "✕"
+            icon_color = "#EF4444"
+        elif completed == total:
+            icon_text = "✓"
+            icon_color = "#10B981"
+        else:
+            icon_text = "●"
+            icon_color = "#F59E0B"
+
+        icon = QLabel(icon_text)
+        icon.setStyleSheet(f"color: {icon_color}; font-weight: bold; border: none;")
+        icon.setFixedWidth(16)
+        layout.addWidget(icon)
+
+        # 目标摘要
+        goal_short = state.goal[:36] + ("..." if len(state.goal) > 36 else "")
+        goal_label = QLabel(goal_short)
+        goal_label.setFont(QFont("", 9))
+        goal_label.setStyleSheet("border: none;")
+        layout.addWidget(goal_label, 1)
+
+        # 步骤统计
+        stats = QLabel(f"{completed}/{total}")
+        stats.setFont(QFont("", 8))
+        stats.setStyleSheet("color: #9CA3AF; border: none;")
+        layout.addWidget(stats)
+
+        item.mousePressEvent = lambda e, s=state: self._on_history_item_clicked(s)
+        item._task_state = state
+        return item
+
+    def add_to_history(self, state: TaskState):
+        """添加任务到历史列表"""
+        # 去重（按 task_id）
+        for entry in self._history_items:
+            if entry["state"].task_id == state.task_id:
+                return
+        widget = self._create_history_item(state)
+        self._history_list_layout.insertWidget(0, widget)  # 最新的在最上面
+        self._history_items.insert(0, {"state": state, "widget": widget})
+        self._update_history_toggle_text()
+        self._history_panel.show()
+
+    def _on_history_item_clicked(self, state: TaskState):
+        """点击历史任务条目，加载并显示"""
+        self._progress_widget.update_task_state(state)
+        self._status_label.setText(
+            f"History: {state.goal[:50]}"
+        )
 
     def update_task_state(self, task_state: TaskState):
         """更新任务状态（实时任务）"""
         self._progress_widget.update_task_state(task_state)
         self._status_label.setText(f"Task {task_state.task_id}: {task_state.phase.value.title()}")
-        # 有实时任务时隐藏历史栏和恢复按钮
-        self._history_bar.hide()
+        # 有实时任务时折叠历史列表
+        self._history_container.setVisible(False)
+        self._update_history_toggle_text()
         self._resume_btn.hide()
 
     def show_resume(self, task_state: TaskState):
@@ -489,20 +558,18 @@ class TaskStepsPanel(QFrame):
         """刷新 — 恢复显示历史栏"""
         self._resume_btn.hide()
         self._resumable_state = None
-        if self._loaded_history:
-            self._history_bar.show()
-            self._status_label.setText("No active task")
-            self._progress_widget._step_widgets.clear()
-            while self._progress_widget._steps_layout.count():
-                child = self._progress_widget._steps_layout.takeAt(0)
-                if child.widget():
-                    child.widget().deleteLater()
-            self._progress_widget._title_label.setText("Task Progress")
-            self._progress_widget._progress_bar.setValue(0)
-            self._progress_widget._progress_bar.setFormat("0/0 steps")
-            self._progress_widget._phase_label.setText("Phase: -")
-            self._progress_widget._steps_label.setText("Steps: 0/0")
-            self._progress_widget._errors_label.setText("Errors: 0")
+        self._status_label.setText("No active task")
+        self._progress_widget._step_widgets.clear()
+        while self._progress_widget._steps_layout.count():
+            child = self._progress_widget._steps_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self._progress_widget._title_label.setText("Task Progress")
+        self._progress_widget._progress_bar.setValue(0)
+        self._progress_widget._progress_bar.setFormat("0/0 steps")
+        self._progress_widget._phase_label.setText("Phase: -")
+        self._progress_widget._steps_label.setText("Steps: 0/0")
+        self._progress_widget._errors_label.setText("Errors: 0")
 
     def clear(self):
         """清空任务状态"""
@@ -513,5 +580,3 @@ class TaskStepsPanel(QFrame):
             if child.widget():
                 child.widget().deleteLater()
         self._status_label.setText("No active task")
-        # 恢复历史栏
-        QTimer.singleShot(100, self._scan_history)
